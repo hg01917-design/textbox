@@ -6,7 +6,10 @@ import subprocess
 import threading
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from tkinter import messagebox, ttk
+
+DATA_DIR = Path(__file__).parent / "data"
 
 from config import BLOG_PROFILES, get_blog_profile, load_env, read_env_values, save_env_values
 from content.generator import generate_draft_with_sources
@@ -102,8 +105,24 @@ class BlogDrafterApp(tk.Tk):
         self.status_var = tk.StringVar(value="대기 중")
         ttk.Label(self, textvariable=self.status_var, padding=(10, 0)).pack(fill="x")
 
-        paned = ttk.PanedWindow(self, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=10, pady=10)
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
+        draft_tab = ttk.Frame(self.notebook)
+        self.notebook.add(draft_tab, text="  초안 작성  ")
+        self._build_draft_tab(draft_tab)
+
+        pub_tab = ttk.Frame(self.notebook)
+        self.notebook.add(pub_tab, text="  공공데이터  ")
+        self._pub_all_items: list = []
+        self._pub_filtered: list = []
+        self._pub_selected: tuple | None = None
+        self._build_public_data_tab(pub_tab)
+
+    def _build_draft_tab(self, parent):
+        paned = ttk.PanedWindow(parent, orient="horizontal")
+        paned.pack(fill="both", expand=True)
 
         left = ttk.Frame(paned)
         right = ttk.Frame(paned)
@@ -123,6 +142,302 @@ class BlogDrafterApp(tk.Tk):
         ttk.Label(right, text="초안 미리보기").pack(anchor="w")
         self.preview = tk.Text(right, wrap="word")
         self.preview.pack(fill="both", expand=True)
+
+    # ─── 공공데이터 탭 ─────────────────────────────────────────────
+
+    def _build_public_data_tab(self, parent):
+        # 검색 바
+        search_frame = ttk.Frame(parent, padding=(4, 4))
+        search_frame.pack(fill="x")
+
+        ttk.Label(search_frame, text="검색:").pack(side="left")
+        self._pub_search_var = tk.StringVar()
+        self._pub_search_var.trace_add("write", lambda *_: self._filter_pub_list())
+        ttk.Entry(search_frame, textvariable=self._pub_search_var, width=36).pack(side="left", padx=4)
+
+        self._pub_src_var = tk.StringVar(value="전체")
+        for label in ("전체", "정부24", "복지로"):
+            ttk.Radiobutton(
+                search_frame, text=label, variable=self._pub_src_var,
+                value=label, command=self._filter_pub_list,
+            ).pack(side="left", padx=2)
+
+        self._pub_count_var = tk.StringVar(value="로딩 중...")
+        ttk.Label(search_frame, textvariable=self._pub_count_var, foreground="gray").pack(side="left", padx=10)
+        ttk.Button(search_frame, text="새로고침", command=self._reload_pub_data).pack(side="right")
+
+        # 좌우 분할
+        paned = ttk.PanedWindow(parent, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # ── 왼쪽: 목록
+        list_frame = ttk.Frame(paned)
+        paned.add(list_frame, weight=2)
+
+        self._pub_listbox = tk.Listbox(list_frame, selectmode="single", activestyle="dotbox")
+        scroll_y = ttk.Scrollbar(list_frame, orient="vertical", command=self._pub_listbox.yview)
+        self._pub_listbox.config(yscrollcommand=scroll_y.set)
+        scroll_y.pack(side="right", fill="y")
+        self._pub_listbox.pack(fill="both", expand=True)
+        self._pub_listbox.bind("<<ListboxSelect>>", self._on_pub_select)
+
+        # ── 오른쪽: 상세 + 프롬프트 + 결과
+        right_frame = ttk.Frame(paned)
+        paned.add(right_frame, weight=3)
+
+        vpaned = ttk.PanedWindow(right_frame, orient="vertical")
+        vpaned.pack(fill="both", expand=True)
+
+        # 상세 패널
+        detail_lf = ttk.LabelFrame(vpaned, text="선택된 항목 상세")
+        vpaned.add(detail_lf, weight=1)
+        self._pub_detail = tk.Text(detail_lf, height=10, wrap="word", state="disabled", background="#f8f8f8")
+        det_scroll = ttk.Scrollbar(detail_lf, orient="vertical", command=self._pub_detail.yview)
+        self._pub_detail.config(yscrollcommand=det_scroll.set)
+        det_scroll.pack(side="right", fill="y")
+        self._pub_detail.pack(fill="both", expand=True)
+
+        # 글 작성 패널
+        write_lf = ttk.LabelFrame(vpaned, text="글 작성")
+        vpaned.add(write_lf, weight=3)
+
+        ttk.Label(write_lf, text="프롬프트 — 이 공공 정보로 어떤 글을 쓸지 지시하세요").pack(anchor="w", padx=4, pady=(4, 0))
+        self._pub_prompt = tk.Text(write_lf, height=5, wrap="word")
+        self._pub_prompt.insert("1.0", "위 공공서비스 정보를 바탕으로, 신청 방법과 대상 조건을 중심으로 블로그 독자가 읽기 쉬운 정부지원 안내 글을 작성해주세요.")
+        self._pub_prompt.pack(fill="x", padx=4, pady=4)
+
+        ctrl_row = ttk.Frame(write_lf)
+        ctrl_row.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(ctrl_row, text="블로그 유형:").pack(side="left")
+        self._pub_blog_type_var = tk.StringVar(value="정부지원")
+        ttk.Combobox(
+            ctrl_row, textvariable=self._pub_blog_type_var,
+            values=list(BLOG_PROFILES), width=10, state="readonly",
+        ).pack(side="left", padx=4)
+        self._pub_gen_btn = ttk.Button(ctrl_row, text="글 작성", command=self._pub_generate)
+        self._pub_gen_btn.pack(side="left", padx=8)
+
+        ttk.Label(write_lf, text="생성 결과").pack(anchor="w", padx=4)
+        self._pub_result = tk.Text(write_lf, wrap="word")
+        res_scroll = ttk.Scrollbar(write_lf, orient="vertical", command=self._pub_result.yview)
+        self._pub_result.config(yscrollcommand=res_scroll.set)
+        res_scroll.pack(side="right", fill="y")
+        self._pub_result.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        pub_row = ttk.Frame(write_lf)
+        pub_row.pack(fill="x", padx=4, pady=4)
+        for text, cmd in (
+            ("WP 임시저장",      self.save_wordpress_draft),
+            ("WP 발행",          self.publish_wordpress),
+            ("Tistory 임시저장", self.save_tistory_draft),
+            ("Tistory 발행",     self.publish_tistory),
+            ("네이버 임시저장",  self.save_naver_draft),
+            ("네이버 발행",      self.publish_naver),
+        ):
+            ttk.Button(pub_row, text=text, command=cmd).pack(side="left", padx=2)
+
+    def _on_tab_change(self, event=None):
+        tab = self.notebook.index(self.notebook.select())
+        if tab == 1 and not self._pub_all_items:
+            self._load_pub_data()
+
+    def _load_pub_data(self):
+        threading.Thread(target=self._load_pub_data_worker, daemon=True).start()
+
+    def _reload_pub_data(self):
+        self._pub_all_items = []
+        self._pub_count_var.set("로딩 중...")
+        self._pub_listbox.delete(0, tk.END)
+        self._load_pub_data()
+
+    def _load_pub_data_worker(self):
+        items: list[tuple[str, str, dict]] = []
+
+        gov24_path = DATA_DIR / "gov24_all.json"
+        if gov24_path.exists():
+            try:
+                data = json.loads(gov24_path.read_text(encoding="utf-8"))
+                for item in data:
+                    name = item.get("서비스명", "").strip()
+                    if name:
+                        items.append((name, "정부24", item))
+            except Exception:
+                pass
+
+        bokjiro_path = DATA_DIR / "bokjiro_all.json"
+        if bokjiro_path.exists():
+            try:
+                data = json.loads(bokjiro_path.read_text(encoding="utf-8"))
+                for item in data:
+                    name = item.get("servNm", "").strip()
+                    if name:
+                        items.append((name, "복지로", item))
+            except Exception:
+                pass
+
+        self._pub_all_items = items
+        self.after(0, self._filter_pub_list)
+
+    def _filter_pub_list(self, *_):
+        search = self._pub_search_var.get().strip().lower()
+        src_filter = self._pub_src_var.get()
+
+        filtered = []
+        for name, source, item in self._pub_all_items:
+            if src_filter != "전체" and source != src_filter:
+                continue
+            if search:
+                haystack = (
+                    name
+                    + item.get("서비스목적요약", "") + item.get("지원대상", "")
+                    + item.get("소관기관명", "") + item.get("servDgst", "")
+                    + item.get("trgterIndvdlArray", "") + item.get("lifeArray", "")
+                    + item.get("intrsThemaArray", "") + item.get("jurMnofNm", "")
+                ).lower()
+                if search not in haystack:
+                    continue
+            filtered.append((name, source, item))
+
+        self._pub_filtered = filtered
+        self._pub_listbox.delete(0, tk.END)
+        for name, source, _ in filtered:
+            self._pub_listbox.insert(tk.END, f"[{source}] {name}")
+        self._pub_count_var.set(f"{len(filtered):,}건")
+
+    def _on_pub_select(self, event=None):
+        sel = self._pub_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._pub_filtered):
+            return
+        name, source, item = self._pub_filtered[idx]
+        self._pub_selected = (name, source, item)
+
+        detail = self._format_pub_detail(name, source, item)
+        self._pub_detail.config(state="normal")
+        self._pub_detail.delete("1.0", tk.END)
+        self._pub_detail.insert("1.0", detail)
+        self._pub_detail.config(state="disabled")
+
+    def _format_pub_detail(self, name: str, source: str, item: dict) -> str:
+        lines = [f"■ {name}  [{source}]\n"]
+        if source == "정부24":
+            fields = [
+                ("소관기관", "소관기관명"),
+                ("지원대상", "지원대상"),
+                ("지원내용", "지원내용"),
+                ("지원금액", "지원금액내용"),
+                ("신청방법", "신청방법내용"),
+                ("신청기간", "신청기간내용"),
+                ("구비서류", "구비서류내용"),
+                ("접수기관", "접수기관내용"),
+                ("요약",     "서비스목적요약"),
+                ("상세URL",  "상세조회URL"),
+            ]
+        else:
+            fields = [
+                ("소관기관", "jurMnofNm"),
+                ("지원대상", "trgterIndvdlArray"),
+                ("생애주기", "lifeArray"),
+                ("주제",     "intrsThemaArray"),
+                ("급여유형", "srvPvsnNm"),
+                ("지급주기", "sprtCycNm"),
+                ("요약",     "servDgst"),
+                ("상세URL",  "servDtlLink"),
+            ]
+        for label, key in fields:
+            value = str(item.get(key, "") or "").strip()
+            if value:
+                lines.append(f"{label}: {value}")
+        return "\n".join(lines)
+
+    def _pub_generate(self):
+        if not self._pub_selected:
+            messagebox.showwarning("항목 선택 필요", "왼쪽 목록에서 항목을 선택하세요.")
+            return
+        user_prompt = self._pub_prompt.get("1.0", tk.END).strip()
+        if not user_prompt:
+            messagebox.showwarning("프롬프트 필요", "프롬프트를 입력하세요.")
+            return
+        self._pub_gen_btn.config(state="disabled")
+        self._pub_result.delete("1.0", tk.END)
+        self._set_status("공공데이터 기반 글 작성 중...")
+        threading.Thread(
+            target=self._pub_generate_worker,
+            args=(self._pub_selected, user_prompt),
+            daemon=True,
+        ).start()
+
+    def _pub_generate_worker(self, selected: tuple, user_prompt: str):
+        try:
+            name, source, item = selected
+            blog_type = self._pub_blog_type_var.get() or "정부지원"
+            source_context = self._format_pub_detail(name, source, item)
+
+            full_prompt = f"""다음 공공서비스 정보를 참고하여 블로그 글을 작성해주세요.
+
+[공공서비스 원문 데이터 — 출처: {source}]
+{source_context}
+
+[작성 지시사항]
+{user_prompt}
+
+아래 형식으로 출력해주세요:
+===제목===
+제목
+
+===본문===
+본문 내용 (마크다운 사용 가능)
+
+===태그===
+태그1, 태그2, 태그3
+"""
+            result = subprocess.run(
+                ["claude", "--print"],
+                input=full_prompt,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            output = (result.stdout or "").strip()
+            if not output:
+                raise ValueError("Claude CLI 응답이 비어 있습니다. claude --print 가 실행 가능한지 확인하세요.")
+
+            from content.parser import parse_ai_response
+            draft = parse_ai_response(output, name, blog_type)
+            quality = check_draft(draft, name)
+            target = self._parse_target(self.target_var.get())
+            payload = {
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "keyword": name,
+                "seed_keyword": name,
+                "blog_type": blog_type,
+                "target": {"platform": target[0], "blog_id": target[1]} if target else {},
+                "draft": draft,
+                "quality": quality,
+                "source_urls": [str(item.get("상세조회URL", "") or item.get("servDtlLink", ""))],
+                "sources": [{"url": source, "ok": True, "error": "", "text": source_context}],
+                "images": [],
+            }
+            paths = save_draft(payload)
+            self.current_payload = payload
+            self.current_paths = paths
+            self.after(0, self._show_pub_result, draft, quality, paths)
+        except Exception as exc:
+            self._log(f"공공데이터 글 작성 오류: {exc}")
+            self._set_status("글 작성 오류")
+        finally:
+            self.after(0, lambda: self._pub_gen_btn.config(state="normal"))
+
+    def _show_pub_result(self, draft: dict, quality: dict, paths: dict):
+        self._pub_result.delete("1.0", tk.END)
+        self._pub_result.insert(tk.END, f"# {draft.get('title', '')}\n\n")
+        self._pub_result.insert(tk.END, draft.get("body", ""))
+        self._log(f"공공데이터 글 완료: {draft.get('title', '')}")
+        self._log(f"Quality: {'PASS' if quality['passed'] else 'WARN'} {quality['warnings']}")
+        self._log(f"저장: {paths['markdown']}")
+        self._set_status(f"글 작성 완료 ({'PASS' if quality['passed'] else 'WARN'})")
 
     def find_keyword_candidates(self):
         keyword = self.keyword_var.get().strip()
