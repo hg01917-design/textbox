@@ -459,14 +459,31 @@ class BlogDrafterApp(tk.Tk):
                 input=prompt, capture_output=True, text=True, timeout=60,
             )
             output = (result.stdout or "").strip()
-            titles = [line.strip().lstrip("0123456789.-) ").strip()
-                      for line in output.splitlines() if line.strip()][:3]
-            if not titles:
-                titles = [name]
+            self._log(f"[제목생성] 원본 응답: {output[:200]}")
+
+            # 번호 붙은 줄만 우선 추출
+            import re as _re
+            numbered = [
+                _re.sub(r"^\d+[\.\)]\s*", "", line).strip().strip("*").strip()
+                for line in output.splitlines()
+                if _re.match(r"^\d+[\.\)]\s+\S", line.strip())
+            ]
+            # 번호 없으면 일반 줄 (단, 크레딧/에러 관련 줄 제외)
+            skip_keywords = ("credit", "balance", "error", "warning", "usage",
+                             "오류", "크레딧", "잔액", "실패", "---", "===")
+            if not numbered:
+                numbered = [
+                    line.strip().strip("*").strip()
+                    for line in output.splitlines()
+                    if line.strip()
+                    and not any(kw in line.lower() for kw in skip_keywords)
+                    and len(line.strip()) > 5
+                ]
+            titles = numbered[:3] or [name]
             self.after(0, self._show_pub_titles, titles)
         except Exception as exc:
             self._log(f"제목 생성 오류: {exc}")
-            self.after(0, self._show_pub_titles, [name])
+            self.after(0, self._show_pub_titles, [f"[오류] {exc}", name])
         finally:
             self.after(0, lambda: self._pub_title_btn.config(state="normal"))
 
