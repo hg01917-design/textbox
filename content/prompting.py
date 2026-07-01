@@ -11,6 +11,7 @@ PROMPT_BY_TYPE = {
     "IT": "it.txt",
     "생활정보": "life.txt",
     "일반": "default.txt",
+    "네이버": "naver.txt",
 }
 
 

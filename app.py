@@ -202,9 +202,12 @@ class BlogDrafterApp(tk.Tk):
         vpaned.add(write_lf, weight=3)
 
         ttk.Label(write_lf, text="프롬프트 — 이 공공 정보로 어떤 글을 쓸지 지시하세요").pack(anchor="w", padx=4, pady=(4, 0))
-        self._pub_prompt = tk.Text(write_lf, height=5, wrap="word")
-        self._pub_prompt.insert("1.0", "위 공공서비스 정보를 바탕으로, 신청 방법과 대상 조건을 중심으로 블로그 독자가 읽기 쉬운 정부지원 안내 글을 작성해주세요.")
+        self._pub_prompt = tk.Text(write_lf, height=8, wrap="word")
         self._pub_prompt.pack(fill="x", padx=4, pady=4)
+        prompt_scroll = ttk.Scrollbar(write_lf, orient="vertical", command=self._pub_prompt.yview)
+        self._pub_prompt.config(yscrollcommand=prompt_scroll.set)
+        prompt_scroll.place(relx=1.0, rely=0, relheight=0.28, anchor="ne")
+        self._load_default_pub_prompt()
 
         ctrl_row = ttk.Frame(write_lf)
         ctrl_row.pack(fill="x", padx=4, pady=(0, 4))
@@ -352,6 +355,20 @@ class BlogDrafterApp(tk.Tk):
                 lines.append(f"{label}: {value}")
         return "\n".join(lines)
 
+    def _load_default_pub_prompt(self):
+        from content.prompting import prompt_path
+        from pathlib import Path
+        naver_path = prompt_path("naver.txt")
+        if naver_path.exists():
+            raw = naver_path.read_text(encoding="utf-8")
+            # 템플릿 변수 제거하고 규칙만 남기기
+            import re as _re
+            cleaned = _re.sub(r"\{[^}]+\}", "", raw).strip()
+            self._pub_prompt.delete("1.0", tk.END)
+            self._pub_prompt.insert("1.0", cleaned)
+        else:
+            self._pub_prompt.insert("1.0", "위 공공서비스 정보를 바탕으로, 신청 방법과 대상 조건을 중심으로 블로그 독자가 읽기 쉬운 정부지원 안내 글을 작성해주세요.")
+
     def _pub_generate(self):
         if not self._pub_selected:
             messagebox.showwarning("항목 선택 필요", "왼쪽 목록에서 항목을 선택하세요.")
@@ -375,23 +392,25 @@ class BlogDrafterApp(tk.Tk):
             blog_type = self._pub_blog_type_var.get() or "정부지원"
             source_context = self._format_pub_detail(name, source, item)
 
-            full_prompt = f"""다음 공공서비스 정보를 참고하여 블로그 글을 작성해주세요.
+            full_prompt = f"""{user_prompt}
 
-[공공서비스 원문 데이터 — 출처: {source}]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+공공서비스 원문 데이터 (출처: {source})
+주제: {name}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {source_context}
 
-[작성 지시사항]
-{user_prompt}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+출력 형식 (반드시 준수)
 
-아래 형식으로 출력해주세요:
-===제목===
-제목
+제목을입력해주세요1: (위 주제를 그대로 사용)
 
-===본문===
-본문 내용 (마크다운 사용 가능)
+본문2:
+(인트로부터 시작)
 
 ===태그===
-태그1, 태그2, 태그3
+태그1, 태그2, 태그3, 태그4, 태그5
+===태그끝===
 """
             result = subprocess.run(
                 ["claude", "--print"],
