@@ -6,3 +6,4 @@ drafts/*.md
 drafts/*.json
 data/*.json
 data/*.db
+data/
