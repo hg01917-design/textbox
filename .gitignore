@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+drafts/*.md
+drafts/*.json
+data/*.json
+data/*.db
