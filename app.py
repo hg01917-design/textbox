@@ -31,7 +31,7 @@ class BlogDrafterApp(tk.Tk):
         super().__init__()
         load_env()
         ensure_prompt_files()
-        self.title("Blog Helper")
+        self.title("textbox v2.0")
         self.geometry("1080x760")
         self.current_payload = None
         self.current_paths = None
@@ -201,12 +201,45 @@ class BlogDrafterApp(tk.Tk):
         write_lf = ttk.LabelFrame(vpaned, text="글 작성")
         vpaned.add(write_lf, weight=3)
 
-        ttk.Label(write_lf, text="프롬프트 — 이 공공 정보로 어떤 글을 쓸지 지시하세요").pack(anchor="w", padx=4, pady=(4, 0))
-        self._pub_prompt = tk.Text(write_lf, height=8, wrap="word")
-        self._pub_prompt.pack(fill="x", padx=4, pady=4)
-        prompt_scroll = ttk.Scrollbar(write_lf, orient="vertical", command=self._pub_prompt.yview)
+        # ── 콘텐츠 유형 선택
+        type_row = ttk.Frame(write_lf)
+        type_row.pack(fill="x", padx=4, pady=(6, 2))
+        ttk.Label(type_row, text="콘텐츠 유형:").pack(side="left")
+        self._pub_content_type_var = tk.StringVar(value="검색용")
+        for label in ("검색용", "홈판용", "AI탭노출용"):
+            ttk.Radiobutton(
+                type_row, text=label,
+                variable=self._pub_content_type_var, value=label,
+                command=self._on_content_type_change,
+            ).pack(side="left", padx=6)
+
+        # ── 제목 영역
+        title_lf = ttk.LabelFrame(write_lf, text="제목")
+        title_lf.pack(fill="x", padx=4, pady=4)
+
+        title_top = ttk.Frame(title_lf)
+        title_top.pack(fill="x", pady=(4, 2))
+        self._pub_title_var = tk.StringVar()
+        ttk.Entry(title_top, textvariable=self._pub_title_var, width=52).pack(side="left", padx=4)
+        self._pub_title_btn = ttk.Button(title_top, text="제목 후보 생성", command=self._pub_gen_titles)
+        self._pub_title_btn.pack(side="left", padx=4)
+
+        self._pub_title_list = tk.Listbox(title_lf, height=3, activestyle="dotbox")
+        title_scroll = ttk.Scrollbar(title_lf, orient="vertical", command=self._pub_title_list.yview)
+        self._pub_title_list.config(yscrollcommand=title_scroll.set)
+        title_scroll.pack(side="right", fill="y", padx=(0, 4))
+        self._pub_title_list.pack(fill="x", padx=4, pady=(0, 4))
+        self._pub_title_list.bind("<<ListboxSelect>>", self._on_title_select)
+
+        # ── 프롬프트
+        ttk.Label(write_lf, text="프롬프트 (유형 변경 시 자동 교체)").pack(anchor="w", padx=4, pady=(2, 0))
+        prompt_frame = ttk.Frame(write_lf)
+        prompt_frame.pack(fill="x", padx=4, pady=4)
+        self._pub_prompt = tk.Text(prompt_frame, height=7, wrap="word")
+        prompt_scroll = ttk.Scrollbar(prompt_frame, orient="vertical", command=self._pub_prompt.yview)
         self._pub_prompt.config(yscrollcommand=prompt_scroll.set)
-        prompt_scroll.place(relx=1.0, rely=0, relheight=0.28, anchor="ne")
+        prompt_scroll.pack(side="right", fill="y")
+        self._pub_prompt.pack(side="left", fill="both", expand=True)
         self._load_default_pub_prompt()
 
         ctrl_row = ttk.Frame(write_lf)
@@ -221,11 +254,13 @@ class BlogDrafterApp(tk.Tk):
         self._pub_gen_btn.pack(side="left", padx=8)
 
         ttk.Label(write_lf, text="생성 결과").pack(anchor="w", padx=4)
-        self._pub_result = tk.Text(write_lf, wrap="word")
-        res_scroll = ttk.Scrollbar(write_lf, orient="vertical", command=self._pub_result.yview)
+        result_frame = ttk.Frame(write_lf)
+        result_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._pub_result = tk.Text(result_frame, wrap="word")
+        res_scroll = ttk.Scrollbar(result_frame, orient="vertical", command=self._pub_result.yview)
         self._pub_result.config(yscrollcommand=res_scroll.set)
         res_scroll.pack(side="right", fill="y")
-        self._pub_result.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._pub_result.pack(side="left", fill="both", expand=True)
 
         pub_row = ttk.Frame(write_lf)
         pub_row.pack(fill="x", padx=4, pady=4)
@@ -355,19 +390,97 @@ class BlogDrafterApp(tk.Tk):
                 lines.append(f"{label}: {value}")
         return "\n".join(lines)
 
+    # ── 콘텐츠 유형별 프롬프트 파일 매핑
+    _CONTENT_TYPE_PROMPT = {
+        "검색용":    "naver_search.txt",
+        "홈판용":    "naver_home.txt",
+        "AI탭노출용": "naver_ai.txt",
+    }
+
     def _load_default_pub_prompt(self):
+        self._on_content_type_change()
+
+    def _on_content_type_change(self):
         from content.prompting import prompt_path
-        from pathlib import Path
-        naver_path = prompt_path("naver.txt")
-        if naver_path.exists():
-            raw = naver_path.read_text(encoding="utf-8")
-            # 템플릿 변수 제거하고 규칙만 남기기
-            import re as _re
+        import re as _re
+        content_type = self._pub_content_type_var.get() if hasattr(self, "_pub_content_type_var") else "검색용"
+        fname = self._CONTENT_TYPE_PROMPT.get(content_type, "naver_search.txt")
+        path = prompt_path(fname)
+        if path.exists():
+            raw = path.read_text(encoding="utf-8")
             cleaned = _re.sub(r"\{[^}]+\}", "", raw).strip()
-            self._pub_prompt.delete("1.0", tk.END)
-            self._pub_prompt.insert("1.0", cleaned)
         else:
-            self._pub_prompt.insert("1.0", "위 공공서비스 정보를 바탕으로, 신청 방법과 대상 조건을 중심으로 블로그 독자가 읽기 쉬운 정부지원 안내 글을 작성해주세요.")
+            cleaned = "위 공공서비스 정보를 바탕으로 블로그 글을 작성해주세요."
+        self._pub_prompt.delete("1.0", tk.END)
+        self._pub_prompt.insert("1.0", cleaned)
+
+    def _pub_gen_titles(self):
+        if not self._pub_selected:
+            messagebox.showwarning("항목 선택 필요", "왼쪽 목록에서 항목을 먼저 선택하세요.")
+            return
+        self._pub_title_btn.config(state="disabled")
+        self._pub_title_list.delete(0, tk.END)
+        self._pub_title_list.insert(tk.END, "제목 후보 생성 중...")
+        content_type = self._pub_content_type_var.get()
+        threading.Thread(
+            target=self._pub_gen_titles_worker,
+            args=(self._pub_selected, content_type),
+            daemon=True,
+        ).start()
+
+    def _pub_gen_titles_worker(self, selected: tuple, content_type: str):
+        try:
+            name, source, item = selected
+            summary = (item.get("서비스목적요약") or item.get("servDgst") or "").strip()[:200]
+            target  = (item.get("지원대상") or item.get("trgterIndvdlArray") or "").strip()[:150]
+            amount  = (item.get("지원금액내용") or item.get("지원내용") or "").strip()[:100]
+
+            type_rules = {
+                "검색용":     "세부키워드 포함, 15~25자, 정보성. 예: '청년내일저축계좌 신청자격 2026 확인하는 순서'",
+                "홈판용":     "클릭 유도형, 15자 이내, 궁금증·혜택 강조. 예: '이 혜택 아직도 모르셨어요'",
+                "AI탭노출용": "자연어 질문형 완전한 문장, 20~35자. 예: '청년내일저축계좌 신청 자격이 어떻게 되나요'",
+            }
+            prompt = f"""네이버 블로그 제목 후보 3개를 생성해주세요.
+
+서비스명: {name}
+요약: {summary}
+지원대상: {target}
+지원금액: {amount}
+콘텐츠 유형: {content_type}
+제목 규칙: {type_rules.get(content_type, "")}
+
+규칙:
+- 제목만 한 줄씩 출력 (번호, 설명 없이)
+- 3개 정확히
+- 한국어만
+"""
+            result = subprocess.run(
+                ["claude", "--print"],
+                input=prompt, capture_output=True, text=True, timeout=60,
+            )
+            output = (result.stdout or "").strip()
+            titles = [line.strip().lstrip("0123456789.-) ").strip()
+                      for line in output.splitlines() if line.strip()][:3]
+            if not titles:
+                titles = [name]
+            self.after(0, self._show_pub_titles, titles)
+        except Exception as exc:
+            self._log(f"제목 생성 오류: {exc}")
+            self.after(0, self._show_pub_titles, [name])
+        finally:
+            self.after(0, lambda: self._pub_title_btn.config(state="normal"))
+
+    def _show_pub_titles(self, titles: list[str]):
+        self._pub_title_list.delete(0, tk.END)
+        for t in titles:
+            self._pub_title_list.insert(tk.END, t)
+        if titles:
+            self._pub_title_var.set(titles[0])
+
+    def _on_title_select(self, event=None):
+        sel = self._pub_title_list.curselection()
+        if sel:
+            self._pub_title_var.set(self._pub_title_list.get(sel[0]))
 
     def _pub_generate(self):
         if not self._pub_selected:
@@ -392,18 +505,21 @@ class BlogDrafterApp(tk.Tk):
             blog_type = self._pub_blog_type_var.get() or "정부지원"
             source_context = self._format_pub_detail(name, source, item)
 
+            title_input = self._pub_title_var.get().strip() or name
+            content_type = self._pub_content_type_var.get()
+
             full_prompt = f"""{user_prompt}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 공공서비스 원문 데이터 (출처: {source})
-주제: {name}
+콘텐츠 유형: {content_type}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {source_context}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 출력 형식 (반드시 준수)
 
-제목을입력해주세요1: (위 주제를 그대로 사용)
+제목을입력해주세요1: {title_input}
 
 본문2:
 (인트로부터 시작)
