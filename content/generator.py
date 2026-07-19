@@ -424,7 +424,7 @@ def generate_draft_with_sources(
             used_provider = "codex"
         elif err:
             generation_errors.append(f"codex: {err}")
-    if not ai_raw and provider in {"auto", "openai"}:
+    if not ai_raw and provider == "openai":
         ai_raw, err = _openai_generate(prompt)
         if ai_raw:
             used_provider = "openai"

@@ -19,7 +19,12 @@ DATA_DIR       = Path(__file__).parent.parent / "data"
 GOV24_CACHE    = DATA_DIR / "gov24_all.json"
 BOKJIRO_CACHE  = DATA_DIR / "bokjiro_all.json"
 
-GOVERNMENT_BLOG_TYPES = {"정부지원", "복지", "생활정보"}
+GOVERNMENT_BLOG_TYPES = {"정부지원", "복지"}
+GOVERNMENT_KEYWORDS = (
+    "지원금", "정부지원", "복지", "급여", "바우처", "보조금", "정책자금",
+    "신청자격", "지원대상", "소상공인", "청년지원", "근로장려금", "자녀장려금",
+    "세액공제", "공제", "대출", "보증", "수당", "장려금",
+)
 
 # 로컬 캐시에서 키워드당 반환할 최대 건수
 LOCAL_TOP_N = 8
@@ -28,7 +33,8 @@ DETAIL_TOP_N = 4
 
 
 def fetch_public_source_context(keyword: str, blog_type: str, on_log=None) -> str:
-    if blog_type not in GOVERNMENT_BLOG_TYPES:
+    if not should_fetch_public_api(keyword, blog_type):
+        _log(on_log, f"[공공API] {blog_type} 글은 공공API 자동 보강을 건너뜁니다: {keyword}")
         return ""
     contexts = []
 
@@ -45,6 +51,14 @@ def fetch_public_source_context(keyword: str, blog_type: str, on_log=None) -> st
         contexts.append(support)
 
     return "\n\n".join(contexts)
+
+
+def should_fetch_public_api(keyword: str, blog_type: str) -> bool:
+    """블로그 유형과 키워드에 맞을 때만 정부24/복지로 자료를 가져온다."""
+    if blog_type in GOVERNMENT_BLOG_TYPES:
+        return True
+    src = f"{keyword or ''} {blog_type or ''}".replace(" ", "")
+    return any(token.replace(" ", "") in src for token in GOVERNMENT_KEYWORDS)
 
 
 # ─── 정부24 ──────────────────────────────────────────────────────

@@ -60,6 +60,7 @@ class TabState:
         self.blog_type_var: tk.StringVar | None = None
         self.source_var: tk.StringVar | None = None
         self.prompt_var: tk.StringVar | None = None
+        self.provider_var: tk.StringVar | None = None
         self.card_var: tk.BooleanVar | None = None
         self.affiliate_var: tk.BooleanVar | None = None
         self.public_context_text: tk.Text | None = None
@@ -81,12 +82,19 @@ class BlogDrafterApp(tk.Tk):
         "Naver": "_naver_worker",
     }
     _PLATFORM_LABEL = {"WordPress": "WordPress", "Tistory": "Tistory", "Naver": "네이버"}
+    _PROVIDER_OPTIONS = {
+        "Claude 기본 + 실패 시 Codex": "auto",
+        "Codex": "codex",
+        "Claude": "cli",
+        "OpenAI": "openai",
+        "Template": "template",
+    }
 
     def __init__(self):
         super().__init__()
         load_env()
         ensure_prompt_files()
-        self.title("textbox v2.7")
+        self.title("textbox v2.8")
         self.geometry("1150x780")
         self._build_ui()
 
@@ -465,24 +473,35 @@ class BlogDrafterApp(tk.Tk):
         ttk.Label(control, text="프롬프트").grid(row=2, column=0, sticky="w")
         state.prompt_var = tk.StringVar(value=prompt_for_blog_type(state.blog_type_var.get()))
         ttk.Combobox(
-            control, textvariable=state.prompt_var, values=prompt_names(), width=24, state="readonly",
+            control, textvariable=state.prompt_var, values=prompt_names(), width=20, state="readonly",
         ).grid(row=2, column=1, sticky="w", padx=6)
+
+        ttk.Label(control, text="생성 모델").grid(row=2, column=2, sticky="e", padx=(8, 0))
+        state.provider_var = tk.StringVar(value="Claude 기본 + 실패 시 Codex")
+        ttk.Combobox(
+            control,
+            textvariable=state.provider_var,
+            values=list(self._PROVIDER_OPTIONS),
+            width=22,
+            state="readonly",
+        ).grid(row=2, column=3, sticky="w", padx=6)
+
         state.card_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(control, text="카드 이미지 자동 생성", variable=state.card_var).grid(row=2, column=2, sticky="w", padx=6)
+        ttk.Checkbutton(control, text="카드 이미지 자동 생성", variable=state.card_var).grid(row=3, column=1, sticky="w", padx=6)
         state.affiliate_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             control, text="관련 상품 링크 자동 첨부(쿠팡/MRT)", variable=state.affiliate_var,
-        ).grid(row=2, column=3, sticky="w", padx=6)
+        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=6)
         ttk.Button(control, text="프롬프트 열기", command=lambda s=state: self.open_prompt_file(s)).grid(row=2, column=4, padx=6)
 
         ttk.Label(control, text="공공데이터 요약 (선택사항 — 공공데이터 탭의 '가져가기'로 자동 입력됨)").grid(
-            row=3, column=0, columnspan=5, sticky="w", pady=(8, 0)
+            row=4, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
         state.public_context_text = tk.Text(control, height=3, wrap="word")
-        state.public_context_text.grid(row=4, column=0, columnspan=5, sticky="we", pady=(0, 4))
+        state.public_context_text.grid(row=5, column=0, columnspan=5, sticky="we", pady=(0, 4))
 
         ttk.Label(control, textvariable=state.draft_label_var, font=("", 10, "bold")).grid(
-            row=5, column=0, columnspan=5, sticky="w", pady=(4, 0)
+            row=6, column=0, columnspan=5, sticky="w", pady=(4, 0)
         )
 
         control.columnconfigure(1, weight=1)
@@ -539,6 +558,8 @@ class BlogDrafterApp(tk.Tk):
         target_context = self._target_context(target, blog_type)
         source_urls = [u.strip() for u in state.source_var.get().split(",") if u.strip()]
         prompt_name = state.prompt_var.get()
+        provider_label = state.provider_var.get() if state.provider_var else "Claude 기본 + 실패 시 Codex"
+        provider = self._PROVIDER_OPTIONS.get(provider_label, "auto")
         use_cards = state.card_var.get()
         use_affiliate = state.affiliate_var.get()
         extra_context = state.public_context_text.get("1.0", tk.END).strip()
@@ -548,7 +569,7 @@ class BlogDrafterApp(tk.Tk):
         self._set_status("초안 생성 중...")
         threading.Thread(
             target=self._generate_worker,
-            args=(state, keyword, blog_type, target, target_context, source_urls, prompt_name, use_cards, use_affiliate, extra_context),
+            args=(state, keyword, blog_type, target, target_context, source_urls, prompt_name, provider, provider_label, use_cards, use_affiliate, extra_context),
             daemon=True,
         ).start()
 
@@ -561,6 +582,8 @@ class BlogDrafterApp(tk.Tk):
         target_context: str,
         source_urls: list[str],
         prompt_name: str,
+        provider: str,
+        provider_label: str,
         use_cards: bool,
         use_affiliate: bool,
         extra_context: str,
@@ -591,12 +614,12 @@ class BlogDrafterApp(tk.Tk):
                 source_context = "\n\n".join(part for part in (source_context, extra_context) if part)
                 sources.append({"url": "manual:공공데이터-요약", "ok": True, "error": "", "text": extra_context})
 
-            self._log(state, f"[3/6] CLI 모델 초안 생성: {best_keyword}")
+            self._log(state, f"[3/6] {provider_label} 초안 생성: {best_keyword}")
             draft = generate_draft_with_sources(
                 best_keyword,
                 blog_type,
                 related,
-                provider="cli",
+                provider=provider,
                 source_context=source_context,
                 prompt_name=prompt_name,
                 target_context=target_context,
