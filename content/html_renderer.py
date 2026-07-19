@@ -5,6 +5,17 @@ import re
 
 from .sanitizer import clean_body
 
+# 가독성 개선: 소제목과 본문 사이 간격, 문단 줄간격, 링크 색상 등을 인라인 스타일로 고정한다.
+# (테마 기본 스타일에 기대지 않고 우리가 발행하는 본문 자체가 항상 읽기 편하도록)
+_H2_STYLE = "margin:2.2em 0 0.6em;line-height:1.4;"
+_H3_STYLE = "margin:1.6em 0 0.5em;line-height:1.4;"
+_P_STYLE = "margin:0 0 1.3em;line-height:1.85;"
+_UL_STYLE = "margin:0 0 1.3em;padding-left:1.4em;"
+_LI_STYLE = "margin-bottom:0.5em;line-height:1.8;"
+_LINK_STYLE = "color:#1a56db;text-decoration:underline;font-weight:600;"
+_TABLE_STYLE = "border-collapse:collapse;width:100%;margin:0 0 1.3em;"
+_TABLE_CELL_STYLE = "border:1px solid #ddd;padding:8px 10px;text-align:left;line-height:1.6;"
+
 
 def render_html(markdown_text: str, image_urls: list[str] | None = None) -> str:
     text = clean_body(markdown_text)
@@ -56,32 +67,32 @@ def render_html(markdown_text: str, image_urls: list[str] | None = None) -> str:
         if line.startswith("ㅂㅂㅂ"):
             close_ul()
             heading = line[3:].strip()
-            parts.append(f"<h2>{_inline(heading)}</h2>")
+            parts.append(f'<h2 style="{_H2_STYLE}">{_inline(heading)}</h2>')
             if image_pos < len(image_urls):
                 parts.append(_image_html(image_urls[image_pos]))
                 image_pos += 1
         elif line.startswith("### "):
             close_ul()
-            parts.append(f"<h3>{_inline(line[4:])}</h3>")
+            parts.append(f'<h3 style="{_H3_STYLE}">{_inline(line[4:])}</h3>')
         elif line.startswith("## "):
             close_ul()
-            parts.append(f"<h2>{_inline(line[3:])}</h2>")
+            parts.append(f'<h2 style="{_H2_STYLE}">{_inline(line[3:])}</h2>')
             if image_pos < len(image_urls):
                 parts.append(_image_html(image_urls[image_pos]))
                 image_pos += 1
         elif line.startswith("# "):
             close_ul()
-            parts.append(f"<h2>{_inline(line[2:])}</h2>")
+            parts.append(f'<h2 style="{_H2_STYLE}">{_inline(line[2:])}</h2>')
         elif line.startswith("- [ ] ") or line.startswith("- [x] ") or line.startswith("- "):
             if not in_ul:
-                parts.append("<ul>")
+                parts.append(f'<ul style="{_UL_STYLE}">')
                 in_ul = True
             item = re.sub(r"^- \[[ xX]\]\s*", "", line[2:] if not line.startswith("- [") else line)
             item = item[2:].strip() if item.startswith("- ") else item.strip()
-            parts.append(f"<li>{_inline(item)}</li>")
+            parts.append(f'<li style="{_LI_STYLE}">{_inline(item)}</li>')
         else:
             close_ul()
-            parts.append(f"<p>{_inline(line)}</p>")
+            parts.append(f'<p style="{_P_STYLE}">{_inline(line)}</p>')
             paragraph_count += 1
             if paragraph_count == 2 and image_pos < len(image_urls):
                 parts.append(_image_html(image_urls[image_pos]))
@@ -94,17 +105,34 @@ def render_html(markdown_text: str, image_urls: list[str] | None = None) -> str:
     return "\n".join(part for part in parts if part)
 
 
+_AFFILIATE_LINK_HOSTS = ("link.coupang.com", "myrealt.rip", "agoda.com")
+
+
+def _link_rel(url: str) -> str:
+    if any(host in url for host in _AFFILIATE_LINK_HOSTS):
+        return "noopener sponsored nofollow"
+    return "noopener"
+
+
 def _inline(text: str) -> str:
     safe = html.escape(text.strip(), quote=True)
     safe = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
-    safe = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r'<a href="\2" target="_blank" rel="noopener">\1</a>', safe)
+    safe = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        lambda m: f'<a href="{m.group(2)}" target="_blank" rel="{_link_rel(m.group(2))}" style="{_LINK_STYLE}">{m.group(1)}</a>',
+        safe,
+    )
     safe = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", safe)
     return safe
 
 
 def _image_html(url: str) -> str:
     safe_url = html.escape(url, quote=True)
-    return f'<figure><img src="{safe_url}" alt="" loading="lazy" /></figure>'
+    return (
+        f'<figure style="text-align:center;margin:0 0 1.3em;">'
+        f'<img src="{safe_url}" alt="" loading="lazy" style="display:block;margin:0 auto;max-width:100%;height:auto;" />'
+        f'</figure>'
+    )
 
 
 def _is_custom_table_start(line: str) -> bool:
@@ -127,11 +155,11 @@ def _custom_table_to_html(cell_lines: list[str]) -> str:
     for r in range(max_r + 1):
         cols = [cells.get((r, c), "") for c in range(max_c + 1)]
         if r == 0:
-            row = "<tr>" + "".join(f"<th>{_inline(v)}</th>" for v in cols) + "</tr>"
+            row = "<tr>" + "".join(f'<th style="{_TABLE_CELL_STYLE}">{_inline(v)}</th>' for v in cols) + "</tr>"
         else:
-            row = "<tr>" + "".join(f"<td>{_inline(v)}</td>" for v in cols) + "</tr>"
+            row = "<tr>" + "".join(f'<td style="{_TABLE_CELL_STYLE}">{_inline(v)}</td>' for v in cols) + "</tr>"
         rows_html.append(row)
-    return f"<table><thead>{rows_html[0]}</thead><tbody>{''.join(rows_html[1:])}</tbody></table>"
+    return f'<table style="{_TABLE_STYLE}"><thead>{rows_html[0]}</thead><tbody>{"".join(rows_html[1:])}</tbody></table>'
 
 
 def _is_table_start(lines: list[str], index: int) -> bool:
@@ -149,6 +177,9 @@ def _table_to_html(lines: list[str]) -> str:
         return ""
     header = rows[0]
     body = rows[1:]
-    head_html = "".join(f"<th>{_inline(cell)}</th>" for cell in header)
-    body_html = "".join("<tr>" + "".join(f"<td>{_inline(cell)}</td>" for cell in row) + "</tr>" for row in body)
-    return f"<table><thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody></table>"
+    head_html = "".join(f'<th style="{_TABLE_CELL_STYLE}">{_inline(cell)}</th>' for cell in header)
+    body_html = "".join(
+        "<tr>" + "".join(f'<td style="{_TABLE_CELL_STYLE}">{_inline(cell)}</td>' for cell in row) + "</tr>"
+        for row in body
+    )
+    return f'<table style="{_TABLE_STYLE}"><thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody></table>'

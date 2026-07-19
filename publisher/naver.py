@@ -7,41 +7,82 @@ import traceback
 from pathlib import Path
 
 from .browser import connect, get_page
+from .accounts import ensure_chrome_for, login_account_id
+from .login import ensure_naver_login, logout_after_post_enabled, logout_naver
 
 
 # ─── 마크다운 파싱 ──────────────────────────────────────────────
 
+def _parse_custom_table(table_lines: list[str]) -> list[list[str]]:
+    """표 N x M 시작/(r,c) 내용/표 N x M 끝 → 2D 리스트로 파싱."""
+    cells: dict[tuple[int, int], str] = {}
+    max_r = max_c = 0
+    for line in table_lines:
+        m = re.match(r"\((\d+),(\d+)\)\s*(.*)", line.strip())
+        if m:
+            r, c, text = int(m.group(1)), int(m.group(2)), m.group(3).strip()
+            cells[(r, c)] = text
+            max_r = max(max_r, r)
+            max_c = max(max_c, c)
+    if not cells:
+        return []
+    return [
+        [cells.get((r, c), "") for c in range(max_c + 1)]
+        for r in range(max_r + 1)
+    ]
+
+
 def _parse_sections(markdown: str) -> list:
-    """마크다운을 heading/text 섹션 리스트로 분리"""
+    """마크다운 + ㅂㅂㅂ소제목 + 표 N x M 형식을 섹션 리스트로 분리."""
     sections = []
-    current_text = []
+    current_text: list[str] = []
+    in_table = False
+    table_lines: list[str] = []
 
-    for line in markdown.split('\n'):
-        s = line.strip()
-        if s.startswith('## ') or s.startswith('# '):
-            if current_text:
-                body = '\n'.join(current_text).strip()
-                if body:
-                    sections.append({"type": "text", "body": body})
-                current_text = []
-            heading = re.sub(r'^#{1,2}\s+', '', s)
-            sections.append({"type": "heading", "text": heading})
-        elif s.startswith('### '):
-            if current_text:
-                body = '\n'.join(current_text).strip()
-                if body:
-                    sections.append({"type": "text", "body": body})
-                current_text = []
-            heading = s[4:].strip()
-            sections.append({"type": "heading", "text": heading})
-        else:
-            current_text.append(line)
-
-    if current_text:
+    def flush_text():
         body = '\n'.join(current_text).strip()
         if body:
             sections.append({"type": "text", "body": body})
+        current_text.clear()
 
+    for line in markdown.split('\n'):
+        s = line.strip()
+
+        if re.match(r"표\s*\d+\s*x\s*\d+\s*시작", s):
+            flush_text()
+            in_table = True
+            table_lines = []
+            continue
+
+        if re.match(r"표\s*\d+\s*x\s*\d+\s*끝", s):
+            in_table = False
+            rows = _parse_custom_table(table_lines)
+            if rows:
+                sections.append({"type": "table", "rows": rows})
+            table_lines = []
+            continue
+
+        if in_table:
+            table_lines.append(s)
+            continue
+
+        if s.startswith('ㅂㅂㅂ'):
+            flush_text()
+            sections.append({"type": "heading", "text": s[3:].strip()})
+            continue
+
+        if s.startswith('## ') or s.startswith('# '):
+            flush_text()
+            sections.append({"type": "heading", "text": re.sub(r'^#{1,2}\s+', '', s)})
+            continue
+        if s.startswith('### '):
+            flush_text()
+            sections.append({"type": "heading", "text": s[4:].strip()})
+            continue
+
+        current_text.append(line)
+
+    flush_text()
     return sections
 
 
@@ -82,6 +123,9 @@ def _iter_naver_blocks(sections: list):
             if text:
                 yield "heading", text
             continue
+        if section["type"] == "table":
+            yield "table", section["rows"]
+            continue
         paragraphs = re.split(r'\n\s*\n', section["body"])
         for para in paragraphs:
             lines = [_clean_markdown_line(line) for line in para.split('\n')]
@@ -99,7 +143,9 @@ def _clean_markdown_line(line: str) -> str:
     if re.fullmatch(r"\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?", line):
         return ""
     line = re.sub(r"^#{1,6}\s+", "", line)
+    line = re.sub(r"^\d+\.\s+", "", line)
     line = re.sub(r"^[-*+]\s+", "", line)
+    line = re.sub(r"^\[[ xX]\]\s*", "", line)
     line = re.sub(r"^>\s*", "", line)
     line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
     line = re.sub(r"__([^_]+?)__", r"\1", line)
@@ -315,6 +361,270 @@ def _apply_heading_formats(page, headings: list[str], on_log=None) -> int:
         return 0
 
 
+def _table_shape(page) -> tuple[int, int]:
+    """마지막 표 컴포넌트의 (행, 열) 개수."""
+    shape = page.evaluate("""() => {
+        const tables = document.querySelectorAll('.se-component.se-table, .se-table-component');
+        const last = tables[tables.length - 1];
+        if (!last) return [0, 0];
+        const content = last.querySelector('.se-table-content') || last;
+        const trs = Array.from(content.querySelectorAll('tr'));
+        const cols = trs[0] ? trs[0].querySelectorAll('td').length : 0;
+        return [trs.length, cols];
+    }""")
+    return tuple(shape)
+
+
+def _click_first_table_cell(page) -> None:
+    """마지막 표의 첫 셀을 클릭해 행/열 선택 상태를 초기화한다."""
+    try:
+        tables = page.query_selector_all(".se-component.se-table, .se-table-component")
+        if not tables:
+            return
+        cell = tables[-1].query_selector("td")
+        if cell:
+            cell.click()
+            time.sleep(0.3)
+    except Exception:
+        pass
+
+
+def _click_axis_add(page, axis: str) -> bool:
+    return page.evaluate(f"""() => {{
+        const tables = document.querySelectorAll('.se-component.se-table, .se-table-component');
+        const last = tables[tables.length - 1];
+        if (!last) return false;
+        const bar = last.querySelector('.se-cell-controlbar-{axis}');
+        if (!bar) return false;
+        bar.dispatchEvent(new MouseEvent('mouseenter', {{bubbles: true}}));
+        bar.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
+        const items = bar.querySelectorAll('.se-cell-controlbar-item');
+        if (!items.length) return false;
+        const addBtn = items[items.length - 1].querySelector('.se-cell-add-button');
+        if (!addBtn) return false;
+        addBtn.click();
+        return true;
+    }}""")
+
+
+def _click_axis_delete(page, axis: str) -> bool:
+    # 선택과 삭제를 하나의 evaluate 호출 안에서 동기적으로 처리해야 한다.
+    # 두 번의 page.evaluate 호출로 나누면 그 사이 재렌더링 때문에
+    # "마지막" 삭제 버튼을 잘못 짚어 삭제가 조용히 실패할 수 있다
+    # (실측으로 확인됨 — 별도 호출로 나누면 셀 수가 줄지 않았다).
+    return page.evaluate(f"""() => {{
+        const tables = document.querySelectorAll('.se-component.se-table, .se-table-component');
+        const last = tables[tables.length - 1];
+        if (!last) return false;
+        const bar = last.querySelector('.se-cell-controlbar-{axis}');
+        if (!bar) return false;
+        const items = bar.querySelectorAll('.se-cell-controlbar-item');
+        if (items.length <= 1) return false;
+        items[items.length - 1].querySelector('.se-cell-select-button').click();
+        const btns = Array.from(document.querySelectorAll('.se-context-menu-button-delete'));
+        const onscreen = btns.filter(b => {{
+            const r = b.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        }});
+        if (!onscreen.length) return false;
+        onscreen[onscreen.length - 1].click();
+        return true;
+    }}""")
+
+
+def _resize_table_axis(page, axis: str, delta: int, on_log=None) -> bool:
+    """표의 마지막 행/열을 delta만큼 추가(양수)하거나 삭제(음수)한다.
+
+    SmartEditor3는 표 버튼 클릭 시 크기 선택 팝업 없이 곧바로 기본 3x3 표를
+    삽입하므로, 원하는 N x M 크기는 행/열 컨트롤바의 +(추가)/삭제 버튼으로
+    맞춰야 한다 (실제 로그인 세션에서 확인).
+
+    행/열 개수가 늘어나는(add) 반응은 클릭 직후 바로 반영되지 않고 비동기로
+    조금 늦게 렌더링될 때가 있다 — 고정된 sleep 한 번만으로는 이 지연을
+    실패로 오판해서 아직 진행 중인 조정을 중간에 포기하는 문제가 실측으로
+    확인됨. 그래서 클릭 후에는 실제로 개수가 바뀔 때까지 짧게 폴링하고,
+    반영이 안 되면 한 번 더 클릭을 재시도한다.
+    """
+    label = "행" if axis == "row" else "열"
+    axis_index = 0 if axis == "row" else 1
+    for _ in range(abs(delta)):
+        before = _table_shape(page)[axis_index]
+        expected = before + (1 if delta > 0 else -1)
+
+        ok = _click_axis_add(page, axis) if delta > 0 else _click_axis_delete(page, axis)
+        if not ok:
+            _log(on_log, f"[네이버] 표 {label} {'추가' if delta > 0 else '삭제'} 실패")
+            return False
+
+        reached = False
+        for _attempt in range(10):
+            time.sleep(0.15)
+            if _table_shape(page)[axis_index] == expected:
+                reached = True
+                break
+        if not reached:
+            # 반영이 늦어지는 경우를 대비해 한 번 더 시도
+            ok = _click_axis_add(page, axis) if delta > 0 else _click_axis_delete(page, axis)
+            for _attempt in range(10):
+                time.sleep(0.15)
+                if _table_shape(page)[axis_index] == expected:
+                    reached = True
+                    break
+        if not reached:
+            _log(on_log, f"[네이버] 표 {label} {'추가' if delta > 0 else '삭제'} 반영 확인 실패")
+            return False
+        time.sleep(0.35)
+    return True
+
+
+def _insert_naver_table(page, rows: list[list[str]], on_log=None) -> bool:
+    """SmartEditor3에 실제 표 삽입: 표 버튼 클릭(기본 3x3 생성) → 행/열 크기 맞춤 → 셀별 클릭 입력.
+
+    구버전 SmartEditor는 표 버튼 클릭 시 크기를 고르는 그리드 팝업을 보여줬지만,
+    현재 버전은 팝업 없이 곧바로 기본 3x3 표를 삽입한다. 그래서 원하는 N x M
+    크기는 행/열 컨트롤바의 +/삭제 버튼으로 별도 조정해야 하고, 셀 이동도
+    Tab 키로는 동작하지 않아(모든 텍스트가 첫 셀에 누적됨) 셀을 직접 클릭해야
+    한다. 모두 실제 로그인 세션에서 확인한 내용이다.
+    """
+    if not rows:
+        return False
+    n_rows = len(rows)
+    n_cols = max(len(r) for r in rows)
+    if n_rows == 0 or n_cols == 0:
+        return False
+
+    def _fallback_as_text():
+        page.keyboard.press("Escape")
+        for row in rows:
+            _type_text(page, " | ".join(cell for cell in row))
+            _press_enter(page, 1)
+
+    def _remove_malformed_table_and_fallback():
+        # 크기 조정에 실패한 불완전한 표(내용 없이 빈 셀만 있는 표)를 그대로
+        # 남겨두면 빈 표만 덩그러니 남는다 — 텍스트로 대체하기 전에 방금
+        # 만들다 만 표만 지운다 (이전에 이미 완성된 다른 표는 건드리지 않음).
+        try:
+            page.evaluate("""() => {
+                const tables = document.querySelectorAll('.se-component.se-table, .se-table-component');
+                const last = tables[tables.length - 1];
+                if (last) last.remove();
+            }""")
+            time.sleep(0.2)
+        except Exception:
+            pass
+        _fallback_as_text()
+
+    _dismiss_overlays(page)
+    table_btn = page.query_selector('button[data-name="table"]')
+    if not table_btn:
+        _log(on_log, "[네이버] 표 버튼을 찾을 수 없어 텍스트로 대체합니다.")
+        _fallback_as_text()
+        return False
+
+    try:
+        table_count_before = page.evaluate(
+            "() => document.querySelectorAll('.se-component.se-table, .se-table-component').length"
+        )
+        table_btn.click(timeout=5000)
+        time.sleep(0.6)
+
+        # 표가 "새로" 삽입되었는지 확인 — 페이지 전체 표 개수(절대값)로는
+        # 이전에 삽입된 다른 표 때문에 이번 시도의 실패를 성공으로 오판할 수 있어
+        # 클릭 전/후 개수를 비교(delta)한다.
+        table_count_after = page.evaluate(
+            "() => document.querySelectorAll('.se-component.se-table, .se-table-component').length"
+        )
+        if table_count_after <= table_count_before:
+            _log(on_log, "[네이버] 표 삽입 실패 — 텍스트로 대체합니다.")
+            _fallback_as_text()
+            return False
+
+        default_rows, default_cols = _table_shape(page)
+        _log(on_log, f"[네이버] 표 기본 크기 {default_rows}x{default_cols} → 목표 {n_rows}x{n_cols}로 조정")
+
+        if not _resize_table_axis(page, "column", n_cols - default_cols, on_log=on_log):
+            _remove_malformed_table_and_fallback()
+            return False
+
+        # 열 삭제/추가 직후에는 선택 상태가 남아 있어 행 컨트롤바의 hover
+        # 인식이 실패할 수 있다 (실측으로 확인됨) — 첫 셀을 클릭해 선택
+        # 상태를 초기화한 뒤 행 크기 조정으로 넘어간다.
+        _click_first_table_cell(page)
+
+        if not _resize_table_axis(page, "row", n_rows - default_rows, on_log=on_log):
+            _remove_malformed_table_and_fallback()
+            return False
+
+        final_rows, final_cols = _table_shape(page)
+        if (final_rows, final_cols) != (n_rows, n_cols):
+            _log(on_log, f"[네이버] 표 크기 조정 결과 불일치 ({final_rows}x{final_cols}) — 텍스트로 대체합니다.")
+            _remove_malformed_table_and_fallback()
+            return False
+
+        # 셀별로 직접 클릭 후 입력 — Tab 키로는 셀 간 포커스 이동이 되지 않고
+        # 모든 텍스트가 첫 셀에 누적되는 현상이 실측으로 확인됨.
+        tables = page.query_selector_all(".se-component.se-table, .se-table-component")
+        if not tables:
+            _fallback_as_text()
+            return False
+        cells = tables[-1].query_selector_all("td")
+        idx = 0
+        for row in rows:
+            for cell_text in row:
+                if idx >= len(cells):
+                    break
+                if cell_text:
+                    cells[idx].click()
+                    time.sleep(0.12)
+                    _type_text(page, cell_text)
+                idx += 1
+        time.sleep(0.3)
+
+        # 셀 입력 직후에는 표가 선택된 상태(초록 테두리 + 삭제 아이콘)로 남아
+        # 있어 아래 좌표 클릭이 그 위에 뜬 부유 아이콘에 막힐 수 있다
+        # (실측으로 확인됨) — Escape로 선택 상태를 먼저 해제한다.
+        page.keyboard.press("Escape")
+        time.sleep(0.2)
+
+        # 표 밖으로 커서 이동: 표 아래 좌표를 마우스로 클릭
+        table_rect = page.evaluate("""() => {
+            const tables = document.querySelectorAll('.se-component.se-table, .se-table-component');
+            const lastTable = tables[tables.length - 1];
+            if (!lastTable) return null;
+            const rect = lastTable.getBoundingClientRect();
+            return {x: rect.left + rect.width / 2, y: rect.bottom + 50};
+        }""")
+        if table_rect:
+            page.mouse.click(table_rect['x'], table_rect['y'])
+            time.sleep(0.4)
+        else:
+            # 폴백: 표 안 문단 제외하고 마지막 텍스트 문단 클릭
+            page.evaluate("""() => {
+                const paras = Array.from(document.querySelectorAll(
+                    '.se-content .se-component.se-text .se-text-paragraph'
+                )).filter(p => !p.closest('.se-component.se-table'));
+                const last = paras[paras.length - 1];
+                if (!last) return;
+                last.click();
+                const range = document.createRange();
+                range.selectNodeContents(last);
+                range.collapse(false);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }""")
+            time.sleep(0.3)
+        return True
+
+    except Exception as exc:
+        _log(on_log, f"[네이버] 표 삽입 오류: {exc}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
+
+
 def _upload_image(page, filepath: str) -> bool:
     """네이버 에디터에 이미지 업로드"""
     if not Path(filepath).exists():
@@ -384,6 +694,78 @@ def _clear_image_caption_placeholders(page):
         }""")
     except Exception:
         pass
+
+
+def _insert_template(page, template_name: str, on_log=None) -> bool:
+    """SmartEditor의 "내 템플릿"에 저장된 템플릿을 현재 커서 위치에 삽입한다.
+
+    사용자가 SmartEditor에서 직접 만들어 저장한 템플릿(예: 실제 링크가 걸린
+    제휴 쿠폰 배너 이미지)을 그대로 불러와 붙여넣는다 — 이 함수 자체는 어떤
+    콘텐츠를 넣을지 전혀 판단하지 않고, 이름으로 지정된 저장된 템플릿을 그대로
+    불러오기만 한다.
+    """
+    try:
+        toolbar_btn = page.query_selector(".se-template-toolbar-button")
+        if not toolbar_btn:
+            _log(on_log, "[네이버] 템플릿 버튼을 찾을 수 없습니다.")
+            return False
+        toolbar_btn.click()
+        time.sleep(1.0)
+
+        # "작성 중인 글이 있습니다" 같은 이어서 작성 팝업이 뜨면 취소
+        page.evaluate(r"""() => {
+            for (const b of document.querySelectorAll('button')) {
+                if ((b.innerText || '').trim() === '취소') { b.click(); return; }
+            }
+        }""")
+        time.sleep(0.5)
+
+        # "내 템플릿" 탭 클릭
+        clicked_tab = page.evaluate(r"""() => {
+            for (const el of document.querySelectorAll('*')) {
+                if ((el.innerText || '').trim() === '내 템플릿' && el.children.length === 0) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if not clicked_tab:
+            _log(on_log, "[네이버] '내 템플릿' 탭을 찾을 수 없습니다.")
+            return False
+        time.sleep(0.8)
+
+        # 이름이 일치하는 템플릿 카드 클릭
+        clicked = page.evaluate(r"""(name) => {
+            const items = document.querySelectorAll('.se-doc-template-item');
+            for (const item of items) {
+                const titleEl = item.querySelector('.se-doc-template-title');
+                if (titleEl && titleEl.innerText.trim() === name) {
+                    const link = item.querySelector('.se-doc-template') || item;
+                    link.click();
+                    return true;
+                }
+            }
+            return false;
+        }""", template_name)
+        if not clicked:
+            _log(on_log, f"[네이버] '{template_name}' 템플릿을 목록에서 찾을 수 없습니다.")
+            page.keyboard.press("Escape")
+            return False
+        time.sleep(1.2)
+
+        # 패널 닫기
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
+        _log(on_log, f"[네이버] 템플릿 '{template_name}' 삽입 완료")
+        return True
+    except Exception as exc:
+        _log(on_log, f"[네이버] 템플릿 삽입 오류: {exc}")
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return False
 
 
 def _body_text(page) -> str:
@@ -776,24 +1158,44 @@ def _log(on_log, message: str) -> None:
 
 def post_naver(blog_id: str, title: str, content_markdown: str,
                tags: list = None, image_paths: list = None,
-               category: str = "", status: str = "draft", on_log=None) -> dict:
+               category: str = "", status: str = "draft", on_log=None,
+               template_name: str = "", port: int = None) -> dict:
     """네이버 블로그 임시저장(draft) 또는 발행(publish)
 
     blog_id: 네이버 블로그 아이디 (예: salim1su)
     status: "draft" → 임시저장, "publish" → 발행
+    template_name: 지정하면 본문 맨 앞에 SmartEditor "내 템플릿"에 저장된
+        해당 이름의 템플릿을 불러와 삽입한다 (예: "마이리얼트립"). 실패해도
+        발행 자체는 중단하지 않는다.
+    port: 이 blog_id 계정이 로그인되어 있는 Chrome 디버그 포트 (계정별로 분리된
+        프로필을 쓸 때 지정). 생략하면 CHROME_PORT(.env, 기본 9222) 사용.
     Returns: {"ok": bool, "url": str, "error": str}
     """
     tags = tags or []
     image_paths = [p for p in (image_paths or []) if Path(p).exists()]
     sections = _parse_sections(content_markdown)
 
-    pw, browser = connect()
+    if port is None:
+        port = ensure_chrome_for("naver", blog_id, on_log=on_log)
+    pw, browser = connect(port=port)
     page = None
     try:
         editor_url = f"https://blog.naver.com/{blog_id}/postwrite"
         page = get_page(browser, navigate_to=None)
-        _open_editor(page, blog_id, on_log=on_log)
+        opened = _open_editor(page, blog_id, on_log=on_log)
         time.sleep(random.uniform(3, 5))
+
+        if _looks_like_login_url(page.url) or not opened:
+            account_id = login_account_id("naver", blog_id)
+            _log(on_log, f"[네이버] 로그인 필요 또는 계정 불일치 감지 — 저장 계정 '{account_id}' 선택 시도")
+            if not _looks_like_login_url(page.url):
+                logout_naver(page, on_log=on_log)
+            if not ensure_naver_login(page, blog_id, account_id=account_id, on_log=on_log):
+                return {"ok": False, "error": f"네이버 저장 계정 로그인 실패: {account_id or blog_id}"}
+            opened = _open_editor(page, blog_id, on_log=on_log)
+            time.sleep(random.uniform(2, 3))
+            if not opened and not page.query_selector(".se-content"):
+                return {"ok": False, "error": f"네이버 로그인 후 글쓰기 화면 진입 실패: {page.url}"}
 
         current_url = page.url
         if "about:blank" in current_url:
@@ -828,6 +1230,18 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
                              f"남은 내용: {existing_body[:120]}",
                 }
 
+        # ── 템플릿 삽입 (고지 배지 + 쿠폰 배너가 합쳐진 템플릿, 항상 맨 처음) ──
+        if template_name:
+            if not _focus_body(page):
+                _click_body_area_by_position(page)
+            time.sleep(0.3)
+            if _insert_template(page, template_name, on_log=on_log):
+                _focus_body(page)
+                page.keyboard.press("End")
+                _press_enter(page, 1)
+            else:
+                _log(on_log, "[네이버] 템플릿 삽입 실패 — 템플릿 없이 계속 진행합니다.")
+
         # ── 제목 입력 ──
         clean_title = title.split('\n')[0].strip()
         title_sel = ".se-documentTitle .se-text-paragraph"
@@ -842,10 +1256,12 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
         _paste_text(page, clean_title)
         time.sleep(0.5)
 
-        # ── 본문 영역 포커스 ──
+        # ── 본문 영역 포커스 (템플릿 뒤로 이동) ──
         if not _focus_body(page):
             _log(on_log, "[네이버] 본문 포커스 자동 확인 실패 — 제목 아래 영역 클릭 후 계속 진행합니다.")
             _click_body_area_by_position(page)
+        else:
+            page.keyboard.press("Meta+End")
         time.sleep(random.uniform(0.5, 1.0))
 
         # ── 본문 입력 + 이미지 분산 삽입 ──
@@ -868,17 +1284,26 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
             _log(on_log, f"[네이버] 카드 이미지 {n_images}장을 본문 사이에 분산 삽입합니다.")
 
         uploaded = 0
-        for index, (block_type, text) in enumerate(blocks):
+        _log(on_log, f"[네이버] 본문 입력 시작 — 총 {n_blocks}개 블록 (약 {n_blocks * 3 // 2}초 소요 예상)")
+        for index, (block_type, content) in enumerate(blocks):
             if index > 0:
                 _press_enter(page, 1)
-            _type_text(page, text)
-            if block_type == "heading":
-                time.sleep(0.2)
-                if _apply_heading_format(page):
-                    _log(on_log, f"[네이버] 소제목 서식 적용: {text}")
-                else:
-                    _log(on_log, f"[네이버] 소제목 서식 적용 실패: {text}")
-            _press_enter(page, 1)
+            if block_type == "table":
+                rows = content
+                preview = f"표 {len(rows)}x{max(len(r) for r in rows)}"
+                _log(on_log, f"[네이버] 블록 입력 중 [{index + 1}/{n_blocks}] {preview}")
+                _insert_naver_table(page, rows, on_log=on_log)
+            else:
+                text = content
+                _log(on_log, f"[네이버] 블록 입력 중 [{index + 1}/{n_blocks}] {text[:20]}{'...' if len(text) > 20 else ''}")
+                _type_text(page, text)
+                if block_type == "heading":
+                    time.sleep(0.2)
+                    if _apply_heading_format(page):
+                        _log(on_log, f"[네이버] 소제목 서식 적용: {text}")
+                    else:
+                        _log(on_log, f"[네이버] 소제목 서식 적용 실패: {text}")
+                _press_enter(page, 1)
 
             for img_path in image_insert_map.get(index, []):
                 if _upload_image(page, img_path):
@@ -1042,6 +1467,8 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
             pass
         return {"ok": False, "error": error}
     finally:
+        if page and not page.is_closed() and logout_after_post_enabled():
+            logout_naver(page, on_log=on_log)
         try:
             pw.stop()
         except Exception:

@@ -24,7 +24,8 @@ def markdown_to_html(markdown: str) -> str:
 
 def create_post(title: str, content_markdown: str, tags: list[str] | None = None,
                 status: str | None = None, category: str = "", image_paths: list[str] | None = None,
-                site_url: str = "", user: str = "", app_password: str = "") -> dict:
+                site_url: str = "", user: str = "", app_password: str = "", post_id: int = 0) -> dict:
+    """post_id를 지정하면 새 글을 만드는 대신 해당 글을 수정한다 (WordPress REST API는 기존 글 수정을 지원)."""
     if not site_url:
         ok, missing = configured()
         if not ok:
@@ -49,7 +50,10 @@ def create_post(title: str, content_markdown: str, tags: list[str] | None = None
             media.append(uploaded)
         else:
             return {"ok": False, "error": f"Image upload failed: {uploaded.get('error')}"}
-    image_urls = [item["url"] for item in media if item.get("url")]
+    # media[0]은 featured_media(제목 위 대표 이미지)로 쓰이므로, 본문 안에 또
+    # 넣으면 같은 이미지가 두 번 보인다 — 본문용 목록에서는 제외한다.
+    inline_media = media[1:] if media else media
+    image_urls = [item["url"] for item in inline_media if item.get("url")]
     content_html = render_html(content_markdown, image_urls=image_urls)
     checked = final_check(title, content_markdown, content_html, image_urls=image_urls)
     if not checked["passed"]:
@@ -66,8 +70,9 @@ def create_post(title: str, content_markdown: str, tags: list[str] | None = None
     if media:
         body["featured_media"] = media[0]["id"]
     try:
+        endpoint = f"{site_url}/wp-json/wp/v2/posts/{post_id}" if post_id else f"{site_url}/wp-json/wp/v2/posts"
         req = urllib.request.Request(
-            f"{site_url}/wp-json/wp/v2/posts",
+            endpoint,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -91,6 +96,15 @@ def _inline(text: str) -> str:
     return text
 
 
+def _ascii_filename(filename: str) -> str:
+    stem, _, ext = filename.rpartition(".")
+    ascii_stem = re.sub(r"[^A-Za-z0-9_-]+", "-", stem).strip("-")
+    ascii_stem = re.sub(r"-{2,}", "-", ascii_stem)
+    if not ascii_stem:
+        ascii_stem = "image"
+    return f"{ascii_stem}.{ext}" if ext else ascii_stem
+
+
 def upload_media(site_url: str, auth: str, image_path: str) -> dict:
     filename = os.path.basename(image_path)
     try:
@@ -99,9 +113,15 @@ def upload_media(site_url: str, auth: str, image_path: str) -> dict:
         return {"ok": False, "error": str(exc)}
     ext = filename.rsplit(".", 1)[-1].lower()
     mime = "image/png" if ext == "png" else "image/jpeg"
+    # 카드 이미지 파일명은 한글을 포함하는데, HTTP 헤더는 latin-1로만 인코딩
+    # 가능해 한글 filename을 그대로 넣으면 요청 전송 시 UnicodeEncodeError가 난다.
+    # WordPress REST API의 미디어 엔드포인트는 RFC 5987 확장 인코딩
+    # (filename*=UTF-8''...)도 받아주지 않고 정확히
+    # `filename="..."` 형식만 허용하므로, 헤더에는 ASCII로 치환한
+    # 파일명만 넣는다 (실제 업로드되는 파일 내용은 그대로).
     headers = {
         "Authorization": f"Basic {auth}",
-        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Disposition": f'attachment; filename="{_ascii_filename(filename)}"',
         "Content-Type": mime,
     }
     try:

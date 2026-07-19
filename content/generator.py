@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import urllib.request
 
@@ -84,9 +85,11 @@ def _build_prompt(
 - 메인 키워드를 제목과 첫 문단에 자연스럽게 포함
 - 첫 문장을 '"{keyword}"이라고 검색하면', '검색해놓고', '검색하는 분들이 많습니다' 같은 문장으로 시작하지 말 것. 키워드를 억지로 넣은 티가 남
 - 첫 문장은 실제 상황 묘사로 시작. 예: '경기도 청년 지원금을 찾아보면 제일 먼저 헷갈리는 게 이름입니다.'
-- 제목은 판단형/문제해결형으로 작성. 예: "다 받을 수 있는 건 아닙니다", "먼저 구분해야 합니다", "내가 받을 수 있는 항목부터 보는 법"
+- 원문 자료를 그대로 요약만 하지 말고, 우선순위·비교·실전 판단 등 이 글만의 추가적인 가치를 더할 것 (구글 "Helpful Content" 기준 — 단순 요약이 아닌 실질적 가치)
+- 검색엔진 노출만을 노린 나열식 정보 대신, 실제 방문자가 읽고 바로 활용할 수 있는 내용으로 작성할 것
+- 제목은 판단형/문제해결형으로 작성하되, "~습니다"/"~있습니다"처럼 완결된 문장으로 끝내지 말 것 — 명사형·구(phrase)로 끝맺을 것. 예: "다 받을 수 있는 건 아닌 이유", "먼저 구분해야 하는 부분", "내가 받을 수 있는 항목부터 보는 법"
 - 제목에 "총정리", "한눈에", "완벽정리"를 쓰지 말 것
-- 본문은 1,800자 이상 권장
+- 분량은 다루는 내용의 깊이에 따라 자연스럽게 정할 것 — 글자수를 채우려고 내용을 늘리지 말 것 (참고 기준: 1,800자 내외)
 - H2 소제목 5개 이상이되, 소제목이 템플릿처럼 보이지 않게 작성
 - 핵심요약은 반드시 포함하되 제목을 자연스럽게 작성. 예: "먼저 구분해야 할 것", "처음엔 이렇게 나눠서 보면 됩니다", "이 부분만 먼저 보면 덜 헷갈립니다"
 - 체크리스트는 필요하면 포함하되 "나는 대상일까?" 같은 고정 제목을 반복하지 말 것
@@ -114,7 +117,15 @@ def _build_prompt(
 
 
 def _append_target_rules(prompt: str, target_context: str) -> str:
-    naver_rule = "- 네이버 블로그용이면 메타설명 섹션을 만들지 말 것. 제목, 본문, 태그만 작성" if "플랫폼=Naver" in target_context else ""
+    is_naver = "플랫폼=Naver" in target_context
+    naver_rule = "- 네이버 블로그용이면 메타설명 섹션을 만들지 말 것. 제목, 본문, 태그만 작성" if is_naver else ""
+    table_rule = (
+        "- 표는 마크다운(|셀|셀|) 문법을 쓰지 말고 반드시 다음 형식만 사용할 것:\n"
+        "표 N x M 시작\n(0,0) 헤더1\n(0,1) 헤더2\n(1,0) 내용\n(1,1) 내용\n표 N x M 끝\n"
+        "(N=행 개수, M=열 개수, (행,열) 좌표는 0부터 시작)"
+        if is_naver
+        else "- 표는 마크다운 파이프(|셀|셀|) 문법으로 작성할 것"
+    )
     return f"""{prompt}
 
 작성 대상 블로그:
@@ -127,6 +138,7 @@ def _append_target_rules(prompt: str, target_context: str) -> str:
 - 네이버 블로그용이면 실제 블로그 운영자가 옆에서 설명하듯 "여기서 헷갈릴 수 있습니다", "이 부분은 먼저 보셔야 합니다" 같은 부드러운 판단 문장을 허용
 - 본문은 반드시 소제목 없는 서론 2문단 이상으로 시작하고, 첫 소제목은 서론 다음에 둘 것
 {naver_rule}
+{table_rule}
 - Tistory/WordPress용이면 소제목과 표를 더 정돈해서 검색 유입형 글로 작성
 - 작성 대상과 맞지 않는 예시를 재사용하지 말 것
 """.strip()
@@ -219,6 +231,15 @@ def _engagement_structure(blog_type: str) -> str:
 7. 상황별 대안
 8. FAQ
 9. 무리 없이 마무리하는 순서"""
+    if blog_type == "리뷰":
+        return """1. 이 제품을 찾게 된 상황/고민으로 시작
+2. 이런 분께 맞는 제품인지 먼저 판단할 기준
+3. 실제 사용 경험 — 장점
+4. 실제 사용 경험 — 단점/아쉬운 점
+5. 비슷한 제품과 비교
+6. 사용 전 체크할 점 또는 자주 하는 실수
+7. FAQ
+8. 추천 대상 정리"""
     return """1. 독자 고민으로 시작
 2. 30초 핵심 요약
 3. 대상/상황 체크리스트
@@ -261,13 +282,19 @@ def _openai_generate(prompt: str) -> tuple[str | None, str]:
 
 def _cli_generate(prompt: str) -> tuple[str | None, str]:
     command = os.environ.get("DRAFTER_CLI_COMMAND", "claude").strip() or "claude"
-    args = os.environ.get("DRAFTER_CLI_ARGS", "--print").strip()
+    args = os.environ.get("DRAFTER_CLI_ARGS", "--print --dangerously-skip-permissions").strip()
     argv = [command] + (shlex.split(args) if args else [])
     child_env = os.environ.copy()
     if command == "claude" and os.environ.get("DRAFTER_CLI_USE_API_KEY", "").strip() != "1":
         # Claude Code CLI should use the logged-in subscription by default.
         # If ANTHROPIC_API_KEY is inherited, it may use depleted API credits instead.
         child_env.pop("ANTHROPIC_API_KEY", None)
+        # Remove Claude Code session vars that cause "Credit balance is too low" errors
+        # when the app is launched from within a Claude Code session.
+        for _var in ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+                     "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_TUI_JUST_SWITCHED",
+                     "CLAUDECODE", "AI_AGENT"):
+            child_env.pop(_var, None)
     try:
         result = subprocess.run(
             argv,
@@ -287,6 +314,47 @@ def _cli_generate(prompt: str) -> tuple[str | None, str]:
     if not output:
         return None, f"{command} returned empty output"
     return output, ""
+
+
+def _codex_generate(prompt: str) -> tuple[str | None, str]:
+    """Claude CLI가 사용량 소진 등으로 실패했을 때 쓰는 대체 경로 (OpenAI Codex CLI).
+
+    `codex login`으로 이미 로그인되어 있어야 하며, API 키는 필요 없다.
+    """
+    import tempfile
+
+    codex_bin = shutil.which("codex") or os.path.expanduser("~/.npm-global/bin/codex")
+    if not codex_bin:
+        return None, "codex CLI가 설치되어 있지 않음"
+
+    with tempfile.NamedTemporaryFile(mode="r", suffix=".txt", delete=False) as tmp:
+        out_path = tmp.name
+    try:
+        result = subprocess.run(
+            [codex_bin, "exec", "--output-last-message", out_path, prompt],
+            text=True,
+            capture_output=True,
+            timeout=360,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip() or result.stdout.strip()
+            return None, f"codex exited {result.returncode}: {stderr[:1000]}"
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                output = f.read().strip()
+        except FileNotFoundError:
+            output = ""
+        if not output:
+            return None, "codex returned empty output"
+        return output, ""
+    except Exception as exc:
+        return None, str(exc)
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
 
 
 def _template_generate(keyword: str, blog_type: str, related_keywords: list[str]) -> str:
@@ -350,6 +418,12 @@ def generate_draft_with_sources(
             used_provider = "cli"
         elif err:
             generation_errors.append(f"cli: {err}")
+    if not ai_raw and provider in {"auto", "cli", "codex"}:
+        ai_raw, err = _codex_generate(prompt)
+        if ai_raw:
+            used_provider = "codex"
+        elif err:
+            generation_errors.append(f"codex: {err}")
     if not ai_raw and provider in {"auto", "openai"}:
         ai_raw, err = _openai_generate(prompt)
         if ai_raw:

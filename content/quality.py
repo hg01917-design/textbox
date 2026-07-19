@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import re
+
+_HTML_TAG_RE = re.compile(r"</?(?:div|span|p|br|img|table|tr|td|th|a|h[1-6]|ul|li|strong|em|b|i)\b[^>]*>", re.IGNORECASE)
 
 
 FORBIDDEN_MARKERS = [
@@ -14,10 +17,16 @@ FORBIDDEN_MARKERS = [
 ]
 
 
-def check_draft(draft: dict, keyword: str, min_chars: int = 1200) -> dict:
+def check_draft(draft: dict, keyword: str, min_chars: int = 1200, image_paths: list | None = None) -> dict:
     warnings = []
     title = draft.get("title", "")
     body = draft.get("body", "")
+
+    if _HTML_TAG_RE.search(body) or _HTML_TAG_RE.search(title):
+        warnings.append("exposed_html_tags")
+    dup_images = _duplicate_images(image_paths or [])
+    if dup_images:
+        warnings.append(f"duplicate_images:{','.join(dup_images)}")
     plain = re.sub(r"[#*`>|\-{}\[\]()]", "", body)
     char_count = len(re.sub(r"\s+", "", plain))
 
@@ -69,6 +78,28 @@ def check_draft(draft: dict, keyword: str, min_chars: int = 1200) -> dict:
         "warnings": warnings,
         "char_count": char_count,
     }
+
+
+def _duplicate_images(image_paths: list) -> list[str]:
+    """같은 이미지 파일(경로 또는 내용 해시)이 두 번 이상 쓰였으면 그 파일명을 반환."""
+    seen_paths: dict[str, int] = {}
+    seen_hashes: dict[str, str] = {}
+    duplicates = []
+    for path in image_paths:
+        seen_paths[path] = seen_paths.get(path, 0) + 1
+        if seen_paths[path] > 1:
+            duplicates.append(path)
+            continue
+        try:
+            with open(path, "rb") as f:
+                digest = hashlib.md5(f.read()).hexdigest()
+        except Exception:
+            continue
+        if digest in seen_hashes:
+            duplicates.append(path)
+        else:
+            seen_hashes[digest] = path
+    return duplicates
 
 
 def _first_paragraph_has_keyword(body: str, keyword: str) -> bool:
@@ -130,7 +161,10 @@ def _has_summary_box(body: str) -> bool:
 
 
 def _has_checklist(body: str) -> bool:
-    return "체크리스트" in body or "[ ]" in body or "- [ ]" in body or "나는 대상" in body
+    return (
+        "체크리스트" in body or "[ ]" in body or "- [ ]" in body or "나는 대상" in body
+        or "□" in body or "☐" in body
+    )
 
 
 def _has_faq(body: str) -> bool:
@@ -141,7 +175,10 @@ def _generic_title(title: str) -> bool:
     generic = ["총정리", "한눈에", "완벽정리", "완벽 가이드"]
     if any(word in title for word in generic):
         return True
-    problem_words = ["받을 수", "헷갈", "먼저", "구분", "조건", "아닙니다", "어디서", "어떻게"]
+    problem_words = [
+        "받을 수", "헷갈", "먼저", "구분", "조건", "아닙니다", "어디서", "어떻게",
+        "이유", "순서", "확인", "결정", "놓치기", "기준", "판단", "부분",
+    ]
     return not any(word in title for word in problem_words)
 
 

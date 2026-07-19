@@ -7,28 +7,32 @@ from playwright_stealth import Stealth
 
 _stealth = Stealth()
 
-_PORT = int(os.environ.get("CHROME_PORT", "9222"))
-_CDP_URL = f"http://localhost:{_PORT}"
+_DEFAULT_PORT = int(os.environ.get("CHROME_PORT", "9222"))
 
 # stealth가 이미 적용된 context 추적 (중복 적용 방지)
 _stealth_applied_contexts: set[int] = set()
 
 
-def _port_open() -> bool:
+def _port_open(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(("localhost", _PORT)) == 0
+        return s.connect_ex(("localhost", port)) == 0
 
 
-def connect():
-    """CDP 연결 + stealth 준비된 (pw, browser) 반환"""
-    if not _port_open():
+def connect(port: int = None):
+    """CDP 연결 + stealth 준비된 (pw, browser) 반환.
+
+    port: 계정별로 분리된 Chrome 디버그 프로필에 연결할 때 지정 (예: 네이버
+    계정마다 다른 포트의 Chrome 인스턴스). 생략하면 CHROME_PORT(.env, 기본 9222).
+    """
+    port = port or _DEFAULT_PORT
+    if not _port_open(port):
         raise RuntimeError(
-            f"Chrome이 CDP 모드로 실행되어 있지 않습니다 (포트 {_PORT}). "
-            "Chrome을 --remote-debugging-port=9222 옵션으로 실행하세요."
+            f"Chrome이 CDP 모드로 실행되어 있지 않습니다 (포트 {port}). "
+            f"Chrome을 --remote-debugging-port={port} 옵션으로 실행하세요."
         )
     pw = sync_playwright().start()
     try:
-        browser = pw.chromium.connect_over_cdp(_CDP_URL)
+        browser = pw.chromium.connect_over_cdp(f"http://localhost:{port}")
     except Exception as e:
         pw.stop()
         raise RuntimeError(f"CDP 연결 실패: {e}")

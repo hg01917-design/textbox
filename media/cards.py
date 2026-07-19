@@ -86,8 +86,6 @@ def _draw_card(path: Path, item: dict, blog_type: str, Image, ImageDraw, ImageFo
             draw.text((166, line_y), line, font=font_body, fill=(35, 45, 55))
             line_y += _line_height(body_size)
         y = line_y + 18
-    font_brand = _font(ImageFont, 28)
-    draw.text((126, bottom - 56), "성실한하루", font=font_brand, fill=(160, 170, 185))
     img.save(path, "JPEG", quality=92, optimize=True)
 
 

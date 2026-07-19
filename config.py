@@ -62,6 +62,55 @@ def save_env_values(updates: dict[str, str]) -> None:
         os.environ[key] = value
 
 
+# WP_BLOG_IDS의 각 항목은 "triplog"처럼 실제로는 다른 계정과 같은 워드프레스
+# 사이트를 가리키는 표시 이름일 수 있다 — 그런 항목은 자체 자격증명이 없으면
+# 아래 별칭을 통해 원본 계정의 자격증명을 그대로 사용한다.
+_LEGACY_WP_CREDENTIAL_ALIASES = {"triplog": "baremi542"}
+
+
+def _env_prefix(blog_id: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in blog_id.upper())
+
+
+def wp_blog_ids() -> list[str]:
+    raw = read_env_values().get("WP_BLOG_IDS", "")
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def wp_credentials(blog_id: str) -> dict:
+    values = read_env_values()
+    prefix = _env_prefix(blog_id)
+    site_url = values.get(f"{prefix}_WP_URL", "")
+    user = values.get(f"{prefix}_WP_USER", "")
+    app_password = values.get(f"{prefix}_WP_APP_PASSWORD", "")
+    if not (site_url and user and app_password):
+        alias = _LEGACY_WP_CREDENTIAL_ALIASES.get(blog_id)
+        if alias:
+            alias_prefix = _env_prefix(alias)
+            site_url = site_url or values.get(f"{alias_prefix}_WP_URL", "")
+            user = user or values.get(f"{alias_prefix}_WP_USER", "")
+            app_password = app_password or values.get(f"{alias_prefix}_WP_APP_PASSWORD", "")
+    return {"site_url": site_url, "user": user, "app_password": app_password}
+
+
+def add_wp_account(blog_id: str, site_url: str, user: str, app_password: str) -> None:
+    ids = wp_blog_ids()
+    updates = {}
+    if blog_id not in ids:
+        ids.append(blog_id)
+        updates["WP_BLOG_IDS"] = ",".join(ids)
+    prefix = _env_prefix(blog_id)
+    updates[f"{prefix}_WP_URL"] = site_url
+    updates[f"{prefix}_WP_USER"] = user
+    updates[f"{prefix}_WP_APP_PASSWORD"] = app_password
+    save_env_values(updates)
+
+
+def remove_wp_account(blog_id: str) -> None:
+    ids = [x for x in wp_blog_ids() if x != blog_id]
+    save_env_values({"WP_BLOG_IDS": ",".join(ids)})
+
+
 BLOG_PROFILES = {
     "정부지원": {
         "theme": "정부지원금, 복지, 신청 조건, 지원 대상",
@@ -87,6 +136,11 @@ BLOG_PROFILES = {
         "theme": "범용 블로그 정보 글",
         "max_competition": 50_000,
         "tone": "읽기 쉬운 정보성 글",
+    },
+    "리뷰": {
+        "theme": "생활용품, 가전, 잡화 등 실제 사용 후기·비교",
+        "max_competition": 50_000,
+        "tone": "실제 써본 사람이 전하는 솔직한 후기",
     },
 }
 
