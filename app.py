@@ -782,22 +782,31 @@ class BlogDrafterApp(tk.Tk):
 
     def publish_platform(self, state: TabState, platform: str, id_var: tk.StringVar):
         label = self._PLATFORM_LABEL[platform]
+        self._log(state, f"[{label}] 발행 버튼 클릭")
+        self._set_status(f"{label} 발행 준비 중...")
         if not self._require_draft(state, "발행"):
+            self._log(state, f"[{label}] 발행 중단: 초안/품질 확인 실패")
             return
         if platform == "Naver" and not self._confirm_naver_images(state):
+            self._log(state, f"[{label}] 발행 중단: 이미지 부족 확인에서 취소")
             return
         blog_id = id_var.get().strip()
         if not blog_id:
-            messagebox.showwarning("ID 필요", f"{label} 블로그 ID를 입력하세요.")
+            self._show_warning("ID 필요", f"{label} 블로그 ID를 입력하세요.")
+            self._log(state, f"[{label}] 발행 중단: 블로그 ID 없음")
             return
-        if not messagebox.askyesno(
+        self._log(state, f"[{label}] 발행 확인 대기: {blog_id}")
+        if not self._ask_yes_no(
             "발행 확인", f"[{blog_id}]\n'{state.current_payload['draft']['title']}'\n\n{label}에 발행하시겠습니까?"
         ):
+            self._log(state, f"[{label}] 발행 중단: 사용자가 발행 확인 취소")
             return
         if not self._confirm_target_match(state, platform, blog_id):
+            self._log(state, f"[{label}] 발행 중단: 작성 대상 불일치 확인에서 취소")
             return
         draft = state.current_payload["draft"]
         self._set_status(f"{label} 발행 중...")
+        self._log(state, f"[{label}] 발행 작업 시작: {blog_id}")
         threading.Thread(
             target=getattr(self, self._PUBLISHER_DISPATCH[platform]),
             args=(state, blog_id, draft, "publish"), daemon=True,
@@ -806,18 +815,25 @@ class BlogDrafterApp(tk.Tk):
     def _publish_or_save(self, state: TabState, platform: str, id_var: tk.StringVar, status: str):
         label = self._PLATFORM_LABEL[platform]
         action_label = "임시저장" if status == "draft" else "발행"
+        self._log(state, f"[{label}] {action_label} 버튼 클릭")
+        self._set_status(f"{label} {action_label} 준비 중...")
         if not self._require_draft(state, action_label):
+            self._log(state, f"[{label}] {action_label} 중단: 초안/품질 확인 실패")
             return
         if platform == "Naver" and not self._confirm_naver_images(state):
+            self._log(state, f"[{label}] {action_label} 중단: 이미지 부족 확인에서 취소")
             return
         blog_id = id_var.get().strip()
         if not blog_id:
-            messagebox.showwarning("ID 필요", f"{label} 블로그 ID를 입력하세요.")
+            self._show_warning("ID 필요", f"{label} 블로그 ID를 입력하세요.")
+            self._log(state, f"[{label}] {action_label} 중단: 블로그 ID 없음")
             return
         if not self._confirm_target_match(state, platform, blog_id):
+            self._log(state, f"[{label}] {action_label} 중단: 작성 대상 불일치 확인에서 취소")
             return
         draft = state.current_payload["draft"]
         self._set_status(f"{label} {action_label} 중...")
+        self._log(state, f"[{label}] {action_label} 작업 시작: {blog_id}")
         threading.Thread(
             target=getattr(self, self._PUBLISHER_DISPATCH[platform]),
             args=(state, blog_id, draft, status), daemon=True,
@@ -892,19 +908,20 @@ class BlogDrafterApp(tk.Tk):
 
     def _require_draft(self, state: TabState, label: str) -> bool:
         if not state.current_payload:
-            messagebox.showwarning("초안 없음", "먼저 초안을 생성하세요.")
+            self._show_warning("초안 없음", "먼저 초안을 생성하세요.")
+            self._set_status("초안 없음: 먼저 초안을 생성하세요")
             return False
         if not self._require_publishable(state):
             return False
         quality = state.current_payload["quality"]
         if not quality["passed"]:
-            return messagebox.askyesno("품질 경고", f"품질 검사를 통과하지 못했습니다. 그래도 {label}할까요?")
+            return self._ask_yes_no("품질 경고", f"품질 검사를 통과하지 못했습니다. 그래도 {label}할까요?")
         return True
 
     def _require_publishable(self, state: TabState) -> bool:
         draft = state.current_payload.get("draft", {}) if state.current_payload else {}
         if draft.get("provider") == "template" or draft.get("publishable") is False:
-            messagebox.showerror(
+            self._show_error(
                 "발행 차단",
                 "Claude/OpenAI 생성에 실패해서 템플릿 초안이 만들어졌습니다.\n"
                 "이 초안은 발행할 수 없습니다.\n\n"
@@ -920,7 +937,7 @@ class BlogDrafterApp(tk.Tk):
         recommended = 5 if blog_type == "여행" else 3
         if len(images) >= recommended:
             return True
-        return messagebox.askyesno(
+        return self._ask_yes_no(
             "이미지 부족",
             f"네이버 글은 이미지가 부족하면 품질이 떨어질 수 있습니다.\n"
             f"현재 이미지: {len(images)}장 / 권장: {recommended}장\n\n"
@@ -933,7 +950,7 @@ class BlogDrafterApp(tk.Tk):
             return True
         if target.get("platform") == platform and target.get("blog_id") == blog_id:
             return True
-        return messagebox.askyesno(
+        return self._ask_yes_no(
             "작성 대상 불일치",
             "이 초안은 다른 블로그 대상으로 생성되었습니다.\n\n"
             f"초안 대상: {target.get('platform')}:{target.get('blog_id')}\n"
@@ -1385,6 +1402,26 @@ class BlogDrafterApp(tk.Tk):
 
     def open_settings(self):
         SettingsWindow(self)
+
+    def _bring_dialog_front(self):
+        try:
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(200, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
+
+    def _ask_yes_no(self, title: str, message: str) -> bool:
+        self._bring_dialog_front()
+        return messagebox.askyesno(title, message, parent=self)
+
+    def _show_warning(self, title: str, message: str):
+        self._bring_dialog_front()
+        return messagebox.showwarning(title, message, parent=self)
+
+    def _show_error(self, title: str, message: str):
+        self._bring_dialog_front()
+        return messagebox.showerror(title, message, parent=self)
 
     def _log(self, state: TabState, message: str):
         try:
