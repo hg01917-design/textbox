@@ -1051,7 +1051,7 @@ def _ensure_fresh_editor(page, on_log=None) -> bool:
     return _clear_body(page, on_log=on_log)
 
 
-def _wait_for_editor_after_login(page, editor_url: str, on_log=None, timeout: int = 300) -> bool:
+def _wait_for_editor_after_login(page, editor_url: str, blog_id: str = "", on_log=None, timeout: int = 300) -> bool:
     """Wait until SmartEditor is available, helping the user-driven login flow.
 
     If Naver shows the login page, the user signs in manually in the same Chrome
@@ -1061,6 +1061,7 @@ def _wait_for_editor_after_login(page, editor_url: str, on_log=None, timeout: in
     deadline = time.time() + timeout
     last_log = 0.0
     retried_postwrite = False
+    auto_login_attempted = False
     while time.time() < deadline:
         try:
             if page.query_selector(".se-content"):
@@ -1075,11 +1076,25 @@ def _wait_for_editor_after_login(page, editor_url: str, on_log=None, timeout: in
             last_log = now
 
         if _looks_like_login_url(url):
-            _log(on_log, "[네이버] 로그인 화면입니다. Chrome 창에서 직접 로그인하세요 (캡챠가 뜨면 풀어주세요).")
-            try:
-                page.bring_to_front()
-            except Exception:
-                pass
+            if blog_id and not auto_login_attempted:
+                auto_login_attempted = True
+                account_id = login_account_id("naver", blog_id)
+                _log(on_log, f"[네이버] 로그인 화면 감지 — 저장 계정 '{account_id}' 자동 로그인 시도")
+                if ensure_naver_login(page, blog_id, account_id=account_id, on_log=on_log):
+                    try:
+                        page.goto(editor_url, wait_until="domcontentloaded", timeout=30000)
+                        retried_postwrite = True
+                        time.sleep(2)
+                    except Exception as exc:
+                        _log(on_log, f"[네이버] 로그인 후 글쓰기 재이동 실패: {exc}")
+                    continue
+                _log(on_log, f"[네이버] 저장 계정 자동 로그인 실패: {account_id}")
+            else:
+                _log(on_log, "[네이버] 로그인 화면입니다. 자동 로그인 재시도 없이 대기합니다.")
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
             time.sleep(5)
             continue
 
@@ -1202,7 +1217,7 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
             return {"ok": False, "error": "페이지 이동 실패 (about:blank) — Chrome CDP 연결 상태를 확인하세요."}
 
         # 에디터 로드 대기 — 로그인 필요 시 Chrome에서 로그인하면 글쓰기 화면으로 재이동
-        if not _wait_for_editor_after_login(page, editor_url, on_log=on_log, timeout=300):
+        if not _wait_for_editor_after_login(page, editor_url, blog_id=blog_id, on_log=on_log, timeout=300):
             return {"ok": False, "error": f"에디터 로드 실패 (5분 초과) — 현재 URL: {page.url}"}
         time.sleep(1)
         initial_popup = _dismiss_overlays(page, on_log=on_log)
