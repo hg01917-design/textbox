@@ -100,6 +100,8 @@ def login_account_id(platform: str, blog_id: str) -> str:
     identity = identity_for(platform, blog_id)
     label = _IDENTITY_LABELS.get(identity, identity)
     label = label.replace("카카오 계정", "").strip()
+    if ":" in label:
+        label = label.split(":", 1)[1].strip()
     if label.endswith("_kakao"):
         label = label[:-6]
     if label.endswith("_naver"):
