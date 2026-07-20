@@ -290,9 +290,9 @@ class BlogDrafterApp(tk.Tk):
                 self._home_tree.set(self._home_tree_items[(p, b)], "status", "확인 중..."),
             ))
             if platform == "네이버":
-                result = stats.naver_today_views(blog_id)
+                result = stats.naver_today_views(blog_id, on_log=lambda m, p=platform, b=blog_id: self._log(self.naver_state, f"[{p}:{b}] {m}"))
             elif platform == "티스토리":
-                result = stats.tistory_today_views(blog_id)
+                result = stats.tistory_today_views(blog_id, on_log=lambda m, p=platform, b=blog_id: self._log(self.tw_state, f"[{p}:{b}] {m}"))
             else:
                 creds = wp_credentials(blog_id)
                 if not all(creds.values()):
