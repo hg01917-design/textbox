@@ -997,6 +997,56 @@ def _title_text(page) -> str:
         return ""
 
 
+def _replace_title(page, title: str, on_log=None) -> bool:
+    """템플릿이 제목 영역에 남긴 문구를 실제 글 제목으로 완전히 교체한다."""
+    try:
+        page.wait_for_selector(".se-documentTitle .se-text-paragraph", timeout=10000)
+        selected = page.evaluate(r"""() => {
+            const para = document.querySelector('.se-documentTitle .se-text-paragraph');
+            if (!para) return false;
+            para.scrollIntoView({block: 'center'});
+            para.focus();
+            para.click();
+            const range = document.createRange();
+            range.selectNodeContents(para);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            return true;
+        }""")
+        if not selected:
+            return False
+        time.sleep(0.2)
+        page.keyboard.press("Backspace")
+        time.sleep(0.2)
+        _paste_text(page, title)
+        time.sleep(0.5)
+        current = _title_text(page)
+        if current == title:
+            return True
+
+        applied = page.evaluate(r"""(title) => {
+            const para = document.querySelector('.se-documentTitle .se-text-paragraph');
+            if (!para) return false;
+            para.innerHTML = '';
+            const span = document.createElement('span');
+            span.textContent = title;
+            para.appendChild(span);
+            para.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: title}));
+            para.dispatchEvent(new Event('change', {bubbles: true}));
+            return true;
+        }""", title)
+        time.sleep(0.4)
+        current = _title_text(page)
+        ok = bool(applied and current == title)
+        if not ok:
+            _log(on_log, f"[네이버] 제목 교체 확인 필요: {current[:80]}")
+        return ok
+    except Exception as exc:
+        _log(on_log, f"[네이버] 제목 교체 오류: {exc}")
+        return False
+
+
 def _is_body_empty(page) -> bool:
     return len(_body_text(page)) <= 5
 
@@ -1259,17 +1309,8 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
 
         # ── 제목 입력 ──
         clean_title = title.split('\n')[0].strip()
-        title_sel = ".se-documentTitle .se-text-paragraph"
-        page.wait_for_selector(title_sel, timeout=10000)
-        title_el = page.query_selector(title_sel)
-        title_el.click()
-        time.sleep(0.5)
-        page.keyboard.press("Meta+a")
-        time.sleep(0.1)
-        page.keyboard.press("Delete")
-        time.sleep(0.3)
-        _paste_text(page, clean_title)
-        time.sleep(0.5)
+        if not _replace_title(page, clean_title, on_log=on_log):
+            return {"ok": False, "error": f"네이버 제목 입력 실패 — 현재 제목: {_title_text(page)[:120]}"}
 
         # ── 본문 영역 포커스 (템플릿 뒤로 이동) ──
         if not _focus_body(page):
