@@ -37,6 +37,7 @@ from content.public_sources import fetch_public_source_context
 from content.quality import check_draft
 from content.source import fetch_sources, format_sources_for_prompt
 from keywords.analyzer import analyze_keyword
+from keywords.ideas import keyword_ideas
 from media.cards import generate_card_images
 import publisher.accounts as accounts
 import publisher.adsense as adsense
@@ -67,6 +68,8 @@ class TabState:
         self.preview: tk.Text | None = None
         self.log_text: tk.Text | None = None
         self.generate_btn: ttk.Button | None = None
+        self.idea_btn: ttk.Button | None = None
+        self.idea_list: tk.Listbox | None = None
         self.target_var: tk.StringVar | None = None
         self.target_combo: ttk.Combobox | None = None
         self.draft_label_var = tk.StringVar(value="현재 초안: 없음")
@@ -494,14 +497,23 @@ class BlogDrafterApp(tk.Tk):
         ).grid(row=3, column=2, columnspan=2, sticky="w", padx=6)
         ttk.Button(control, text="프롬프트 열기", command=lambda s=state: self.open_prompt_file(s)).grid(row=2, column=4, padx=6)
 
+        idea_frame = ttk.LabelFrame(control, text="키워드가 생각 안 날 때", padding=6)
+        idea_frame.grid(row=4, column=0, columnspan=5, sticky="we", pady=(8, 0))
+        state.idea_btn = ttk.Button(idea_frame, text="키워드 추천", command=lambda s=state: self.suggest_keywords(s))
+        state.idea_btn.pack(side="left", padx=(0, 6))
+        state.idea_list = tk.Listbox(idea_frame, height=4, exportselection=False)
+        state.idea_list.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        state.idea_list.bind("<Double-Button-1>", lambda e, s=state: self.use_suggested_keyword(s, e))
+        ttk.Button(idea_frame, text="선택 사용", command=lambda s=state: self.use_suggested_keyword(s)).pack(side="left")
+
         ttk.Label(control, text="공공데이터 요약 (선택사항 — 공공데이터 탭의 '가져가기'로 자동 입력됨)").grid(
-            row=4, column=0, columnspan=5, sticky="w", pady=(8, 0)
+            row=5, column=0, columnspan=5, sticky="w", pady=(8, 0)
         )
         state.public_context_text = tk.Text(control, height=3, wrap="word")
-        state.public_context_text.grid(row=5, column=0, columnspan=5, sticky="we", pady=(0, 4))
+        state.public_context_text.grid(row=6, column=0, columnspan=5, sticky="we", pady=(0, 4))
 
         ttk.Label(control, textvariable=state.draft_label_var, font=("", 10, "bold")).grid(
-            row=6, column=0, columnspan=5, sticky="w", pady=(4, 0)
+            row=7, column=0, columnspan=5, sticky="w", pady=(4, 0)
         )
 
         control.columnconfigure(1, weight=1)
@@ -685,6 +697,50 @@ class BlogDrafterApp(tk.Tk):
         self._log(state, f"JSON: {paths['json']}")
         self._log(state, f"Quality: {'PASS' if quality['passed'] else 'WARN'} {quality['warnings']}")
         self._set_status(f"완료: {'PASS' if quality['passed'] else 'WARN'}")
+
+    def suggest_keywords(self, state: TabState):
+        blog_type = state.blog_type_var.get().strip() if state.blog_type_var else "일반"
+        if not state.idea_btn or not state.idea_list:
+            return
+        state.idea_btn.config(state="disabled")
+        state.idea_list.delete(0, tk.END)
+        state.idea_list.insert(tk.END, "추천 키워드 불러오는 중...")
+        self._set_status(f"{blog_type} 키워드 추천 중...")
+        threading.Thread(target=self._suggest_keywords_worker, args=(state, blog_type), daemon=True).start()
+
+    def _suggest_keywords_worker(self, state: TabState, blog_type: str):
+        try:
+            ideas = keyword_ideas(blog_type, limit=12)
+            self.after(0, self._show_keyword_ideas, state, ideas)
+        except Exception as exc:
+            self.after(0, self._show_keyword_ideas, state, [f"추천 실패: {exc}"])
+        finally:
+            if state.idea_btn:
+                self.after(0, lambda: state.idea_btn.config(state="normal"))
+
+    def _show_keyword_ideas(self, state: TabState, ideas: list[str]):
+        if not state.idea_list:
+            return
+        state.idea_list.delete(0, tk.END)
+        if not ideas:
+            state.idea_list.insert(tk.END, "추천 키워드 없음")
+            self._set_status("추천 키워드 없음")
+            return
+        for idea in ideas:
+            state.idea_list.insert(tk.END, idea)
+        self._set_status("추천 키워드 완료: 더블클릭하면 입력됩니다")
+
+    def use_suggested_keyword(self, state: TabState, event=None):
+        if not state.idea_list or not state.keyword_var:
+            return
+        selection = state.idea_list.curselection()
+        if not selection:
+            return
+        keyword = state.idea_list.get(selection[0]).strip()
+        if not keyword or keyword.startswith("추천 "):
+            return
+        state.keyword_var.set(keyword)
+        self._set_status(f"추천 키워드 선택: {keyword}")
 
     # ─── 네이버글쓰기 탭 ─────────────────────────────────────────────
 
