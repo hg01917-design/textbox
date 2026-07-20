@@ -153,26 +153,43 @@ def tistory_today_views(blog_id: str, on_log=None) -> dict:
 
 
 def wp_today_views(site_url: str, user: str, app_password: str) -> dict:
-    """Jetpack 통계 모듈(REST API)에서 오늘 조회수를 가져온다.
+    """Textbox Stats 또는 Jetpack 통계 모듈에서 오늘 조회수를 가져온다.
 
-    사이트에 Jetpack이 설치되고 통계 모듈이 활성화되어 있어야 한다. 기존
-    WordPress REST API 인증(Application Password)을 그대로 사용한다.
+    Textbox Stats 플러그인이 설치되어 있으면 이를 우선 사용하고, 없으면 기존
+    Jetpack REST API로 fallback한다. 인증은 기존 WordPress Application Password를
+    그대로 사용한다.
 
     Returns: {"ok": bool, "views": int, "error": str}
     """
     site_url = site_url.strip().rstrip("/")
     auth = base64.b64encode(f"{user}:{app_password.replace(' ', '')}".encode("utf-8")).decode("ascii")
+
+    textbox_url = f"{site_url}/wp-json/textbox/v1/stats/today"
+    req = urllib.request.Request(textbox_url, headers={"Authorization": f"Basic {auth}", "User-Agent": "Textbox/1.0"})
+    textbox_error = ""
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        return {"ok": True, "views": int(payload.get("views", 0)), "provider": payload.get("provider", "textbox-stats")}
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            detail = exc.read().decode("utf-8", errors="ignore")[:200]
+            textbox_error = f"Textbox Stats API 오류 ({exc.code}): {detail}"
+    except Exception as exc:
+        textbox_error = f"Textbox Stats API 오류: {exc}"
+
     url = f"{site_url}/wp-json/jetpack/v4/module/stats/data?range=day"
-    req = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"})
+    req = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}", "User-Agent": "Textbox/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")[:200]
         if exc.code == 404:
+            prefix = f"{textbox_error} / " if textbox_error else ""
             return {
                 "ok": False,
-                "error": "Jetpack 통계 API 없음(404) — 워드프레스 Jetpack 통계 모듈이 꺼져 있거나 해당 사이트에서 지원하지 않습니다.",
+                "error": prefix + "워드프레스 통계 모듈 없음 — Textbox Stats 플러그인을 설치하거나 Jetpack 통계 모듈을 켜세요.",
             }
         return {"ok": False, "error": f"Jetpack 통계 API 오류 ({exc.code}): {detail}"}
     except Exception as exc:
