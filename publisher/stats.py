@@ -20,7 +20,7 @@ import urllib.request
 
 from .accounts import ensure_chrome_for, login_account_id, login_hint
 from .browser import connect, get_page
-from .login import ensure_naver_login, ensure_tistory_login, logout_naver
+from .login import ensure_naver_login, ensure_tistory_login, logout_naver, logout_tistory
 
 
 def _log(on_log, message: str) -> None:
@@ -119,23 +119,27 @@ def tistory_today_views(blog_id: str, on_log=None) -> dict:
     pw = browser = None
     try:
         pw, browser = connect(port=port)
-        page = get_page(browser, navigate_to=f"https://{blog_id}.tistory.com/manage/statistics/blog")
-        time.sleep(2)
+        page = get_page(browser)
+        kakao_id = login_account_id("tistory", blog_id)
+        _log(on_log, f"[홈통계] 티스토리 통계 계정 전환 — 저장 계정 '{kakao_id}' 선택")
+        logout_tistory(page, on_log=on_log)
+        if not ensure_tistory_login(page, blog_id, kakao_id=kakao_id, on_log=on_log):
+            hint = login_hint("tistory", blog_id)
+            hint_text = f" — 저장된 {hint}으로 로그인하세요." if hint else ""
+            return {
+                "ok": False,
+                "error": f"자동 로그인 실패 — 포트 {port} Chrome 창에서 직접 확인해주세요.{hint_text}",
+            }
+        page.goto(f"https://{blog_id}.tistory.com/manage/statistics/blog", wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
 
-        if _looks_like_login_url(page.url):
-            kakao_id = login_account_id("tistory", blog_id)
-            _log(on_log, f"[홈통계] 티스토리 로그인 필요 — 저장 계정 '{kakao_id}' 자동 선택 시도")
-            if not ensure_tistory_login(page, blog_id, kakao_id=kakao_id, on_log=on_log):
-                hint = login_hint("tistory", blog_id)
-                hint_text = f" — 저장된 {hint}으로 로그인하세요." if hint else ""
-                return {
-                    "ok": False,
-                    "error": f"자동 로그인 실패 — 포트 {port} Chrome 창에서 직접 확인해주세요.{hint_text}",
-                }
-            page.goto(f"https://{blog_id}.tistory.com/manage/statistics/blog", wait_until="domcontentloaded", timeout=30000)
-            time.sleep(2)
+        if _looks_like_login_url(page.url) or "/manage" not in page.url:
+            return {
+                "ok": False,
+                "error": f"관리자 통계 진입 실패 — 현재 URL: {page.url}",
+            }
 
-        views = _extract_count_near_keywords(page, ["오늘", "today"])
+        views = _extract_count_near_keywords(page, ["오늘 조회수", "오늘조회수", "오늘 방문자", "오늘방문자", "today"])
         if views is None:
             return {
                 "ok": False,
