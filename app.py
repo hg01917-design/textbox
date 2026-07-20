@@ -67,6 +67,7 @@ class TabState:
         self.public_context_text: tk.Text | None = None
         self.preview: tk.Text | None = None
         self.log_text: tk.Text | None = None
+        self.publish_log_text: tk.Text | None = None
         self.generate_btn: ttk.Button | None = None
         self.idea_btn: ttk.Button | None = None
         self.idea_list: tk.Listbox | None = None
@@ -779,6 +780,7 @@ class BlogDrafterApp(tk.Tk):
             publish_cb=lambda: self.publish_platform(self.naver_state, "Naver", self.naver_id_var),
             save_label="네이버 임시저장", publish_label="네이버 발행",
         )
+        self._build_publish_log(publish_frame, self.naver_state)
 
         self._show_sub(self.naver_state, "compose")
 
@@ -816,6 +818,7 @@ class BlogDrafterApp(tk.Tk):
             publish_cb=lambda: self.publish_platform(self.tw_state, "WordPress", self.wp_id_var),
             save_label="WordPress 임시저장", publish_label="WordPress 발행",
         )
+        self._build_publish_log(publish_frame, self.tw_state)
 
         self._show_sub(self.tw_state, "compose")
 
@@ -840,6 +843,13 @@ class BlogDrafterApp(tk.Tk):
         ttk.Button(row, text=publish_label, command=publish_cb).pack(side="left", padx=4)
         return combo
 
+    def _build_publish_log(self, parent, state: TabState):
+        box = ttk.LabelFrame(parent, text="발행 로그", padding=8)
+        box.pack(fill="both", expand=True, padx=8, pady=(8, 6))
+        state.publish_log_text = tk.Text(box, height=18, wrap="word")
+        state.publish_log_text.pack(fill="both", expand=True)
+        state.publish_log_text.insert(tk.END, "발행 버튼을 누르면 진행 로그가 여기에 표시됩니다.\n")
+
     # ─── 저장/발행 액션 (플랫폼 공용) ────────────────────────────────
 
     def save_platform_draft(self, state: TabState, platform: str, id_var: tk.StringVar):
@@ -847,31 +857,31 @@ class BlogDrafterApp(tk.Tk):
 
     def publish_platform(self, state: TabState, platform: str, id_var: tk.StringVar):
         label = self._PLATFORM_LABEL[platform]
-        self._log(state, f"[{label}] 발행 버튼 클릭")
+        self._publish_log(state, f"[{label}] 발행 버튼 클릭")
         self._set_status(f"{label} 발행 준비 중...")
         if not self._require_draft(state, "발행"):
-            self._log(state, f"[{label}] 발행 중단: 초안/품질 확인 실패")
+            self._publish_log(state, f"[{label}] 발행 중단: 초안/품질 확인 실패")
             return
         if platform == "Naver" and not self._confirm_naver_images(state):
-            self._log(state, f"[{label}] 발행 중단: 이미지 부족 확인에서 취소")
+            self._publish_log(state, f"[{label}] 발행 중단: 이미지 부족 확인에서 취소")
             return
         blog_id = id_var.get().strip()
         if not blog_id:
             self._show_warning("ID 필요", f"{label} 블로그 ID를 입력하세요.")
-            self._log(state, f"[{label}] 발행 중단: 블로그 ID 없음")
+            self._publish_log(state, f"[{label}] 발행 중단: 블로그 ID 없음")
             return
-        self._log(state, f"[{label}] 발행 확인 대기: {blog_id}")
+        self._publish_log(state, f"[{label}] 발행 확인 대기: {blog_id}")
         if not self._ask_yes_no(
             "발행 확인", f"[{blog_id}]\n'{state.current_payload['draft']['title']}'\n\n{label}에 발행하시겠습니까?"
         ):
-            self._log(state, f"[{label}] 발행 중단: 사용자가 발행 확인 취소")
+            self._publish_log(state, f"[{label}] 발행 중단: 사용자가 발행 확인 취소")
             return
         if not self._confirm_target_match(state, platform, blog_id):
-            self._log(state, f"[{label}] 발행 중단: 작성 대상 불일치 확인에서 취소")
+            self._publish_log(state, f"[{label}] 발행 중단: 작성 대상 불일치 확인에서 취소")
             return
         draft = state.current_payload["draft"]
         self._set_status(f"{label} 발행 중...")
-        self._log(state, f"[{label}] 발행 작업 시작: {blog_id}")
+        self._publish_log(state, f"[{label}] 발행 작업 시작: {blog_id}")
         threading.Thread(
             target=getattr(self, self._PUBLISHER_DISPATCH[platform]),
             args=(state, blog_id, draft, "publish"), daemon=True,
@@ -880,25 +890,25 @@ class BlogDrafterApp(tk.Tk):
     def _publish_or_save(self, state: TabState, platform: str, id_var: tk.StringVar, status: str):
         label = self._PLATFORM_LABEL[platform]
         action_label = "임시저장" if status == "draft" else "발행"
-        self._log(state, f"[{label}] {action_label} 버튼 클릭")
+        self._publish_log(state, f"[{label}] {action_label} 버튼 클릭")
         self._set_status(f"{label} {action_label} 준비 중...")
         if not self._require_draft(state, action_label):
-            self._log(state, f"[{label}] {action_label} 중단: 초안/품질 확인 실패")
+            self._publish_log(state, f"[{label}] {action_label} 중단: 초안/품질 확인 실패")
             return
         if platform == "Naver" and not self._confirm_naver_images(state):
-            self._log(state, f"[{label}] {action_label} 중단: 이미지 부족 확인에서 취소")
+            self._publish_log(state, f"[{label}] {action_label} 중단: 이미지 부족 확인에서 취소")
             return
         blog_id = id_var.get().strip()
         if not blog_id:
             self._show_warning("ID 필요", f"{label} 블로그 ID를 입력하세요.")
-            self._log(state, f"[{label}] {action_label} 중단: 블로그 ID 없음")
+            self._publish_log(state, f"[{label}] {action_label} 중단: 블로그 ID 없음")
             return
         if not self._confirm_target_match(state, platform, blog_id):
-            self._log(state, f"[{label}] {action_label} 중단: 작성 대상 불일치 확인에서 취소")
+            self._publish_log(state, f"[{label}] {action_label} 중단: 작성 대상 불일치 확인에서 취소")
             return
         draft = state.current_payload["draft"]
         self._set_status(f"{label} {action_label} 중...")
-        self._log(state, f"[{label}] {action_label} 작업 시작: {blog_id}")
+        self._publish_log(state, f"[{label}] {action_label} 작업 시작: {blog_id}")
         threading.Thread(
             target=getattr(self, self._PUBLISHER_DISPATCH[platform]),
             args=(state, blog_id, draft, status), daemon=True,
@@ -918,12 +928,12 @@ class BlogDrafterApp(tk.Tk):
         )
         label = "발행" if status == "publish" else "임시저장"
         if result.get("ok"):
-            self._log(state, f"WordPress {label} 완료: {result.get('link')} / 이미지 {result.get('media_count', 0)}장")
+            self._publish_log(state, f"WordPress {label} 완료: {result.get('link')} / 이미지 {result.get('media_count', 0)}장")
             self._set_status(f"WordPress {label} 완료")
             if status == "publish":
                 record_publish("WordPress", blog_id, draft["title"])
         else:
-            self._log(state, f"WordPress 오류: {result.get('error')}")
+            self._publish_log(state, f"WordPress 오류: {result.get('error')}")
             self._set_status("WordPress 오류")
 
     def _tistory_worker(self, state: TabState, blog_id: str, draft: dict, status: str):
@@ -940,12 +950,12 @@ class BlogDrafterApp(tk.Tk):
         )
         label = "발행" if status == "publish" else "임시저장"
         if result.get("ok"):
-            self._log(state, f"Tistory {label} 완료: {result.get('url')}")
+            self._publish_log(state, f"Tistory {label} 완료: {result.get('url')}")
             self._set_status(f"Tistory {label} 완료")
             if status == "publish":
                 record_publish("Tistory", blog_id, draft["title"])
         else:
-            self._log(state, f"Tistory 오류: {result.get('error')}")
+            self._publish_log(state, f"Tistory 오류: {result.get('error')}")
             self._set_status("Tistory 오류")
 
     def _naver_worker(self, state: TabState, blog_id: str, draft: dict, status: str):
@@ -958,17 +968,17 @@ class BlogDrafterApp(tk.Tk):
             tags=draft.get("tags", []),
             image_paths=state.current_payload.get("images", []),
             status=status,
-            on_log=lambda m: self._log(state, m),
+            on_log=lambda m: self._publish_log(state, m),
             template_name=template_name,
         )
         label = "발행" if status == "publish" else "임시저장"
         if result.get("ok"):
-            self._log(state, f"네이버 {label} 완료: {result.get('url')}")
+            self._publish_log(state, f"네이버 {label} 완료: {result.get('url')}")
             self._set_status(f"네이버 {label} 완료")
             if status == "publish":
                 record_publish("Naver", blog_id, draft["title"])
         else:
-            self._log(state, f"네이버 오류: {result.get('error')}")
+            self._publish_log(state, f"네이버 오류: {result.get('error')}")
             self._set_status("네이버 오류")
 
     def _require_draft(self, state: TabState, label: str) -> bool:
@@ -1488,13 +1498,28 @@ class BlogDrafterApp(tk.Tk):
         self._bring_dialog_front()
         return messagebox.showerror(title, message, parent=self)
 
-    def _log(self, state: TabState, message: str):
+    def _log_file(self, message: str):
         try:
             with open("/tmp/blog-helper.log", "a", encoding="utf-8") as log_file:
                 log_file.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
         except Exception:
             pass
-        self.after(0, lambda: (state.log_text.insert(tk.END, message + "\n"), state.log_text.see(tk.END)))
+
+    def _log(self, state: TabState, message: str):
+        self._log_file(message)
+        def append():
+            if state.log_text:
+                state.log_text.insert(tk.END, message + "\n")
+                state.log_text.see(tk.END)
+        self.after(0, append)
+
+    def _publish_log(self, state: TabState, message: str):
+        self._log_file(message)
+        def append():
+            if state.publish_log_text:
+                state.publish_log_text.insert(tk.END, message + "\n")
+                state.publish_log_text.see(tk.END)
+        self.after(0, append)
 
     def _set_status(self, message: str):
         self.after(0, lambda: self.status_var.set(message))
