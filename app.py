@@ -37,7 +37,7 @@ from content.public_sources import fetch_public_source_context
 from content.quality import check_draft
 from content.source import fetch_sources, format_sources_for_prompt
 from keywords.analyzer import analyze_keyword
-from keywords.ideas import keyword_ideas
+from keywords.ideas import best_keyword_idea, keyword_ideas
 from media.cards import generate_card_images
 import publisher.accounts as accounts
 import publisher.adsense as adsense
@@ -457,6 +457,7 @@ class BlogDrafterApp(tk.Tk):
         ttk.Label(control, text="키워드").grid(row=0, column=0, sticky="w")
         state.keyword_var = tk.StringVar(value="")
         ttk.Entry(control, textvariable=state.keyword_var, width=40).grid(row=0, column=1, sticky="we", padx=6)
+        ttk.Label(control, text="비워두면 자동 선택", foreground="gray").grid(row=0, column=1, sticky="e", padx=(0, 12))
 
         ttk.Label(control, text="블로그 유형").grid(row=0, column=2, sticky="w")
         state.blog_type_var = tk.StringVar(value=default_blog_type)
@@ -559,9 +560,6 @@ class BlogDrafterApp(tk.Tk):
 
     def generate_draft(self, state: TabState):
         keyword = state.keyword_var.get().strip()
-        if not keyword:
-            messagebox.showwarning("입력 필요", "키워드를 입력하세요.")
-            return
         target = self._parse_target(state.target_var.get())
         if not target:
             messagebox.showwarning("작성 대상 필요", "초안을 만들 블로그를 먼저 선택하세요.")
@@ -602,6 +600,17 @@ class BlogDrafterApp(tk.Tk):
     ):
         try:
             profile = get_blog_profile(blog_type)
+            if not keyword:
+                picked = best_keyword_idea(blog_type)
+                keyword = picked["keyword"]
+                if state.keyword_var:
+                    self.after(0, lambda: state.keyword_var.set(keyword))
+                self._log(
+                    state,
+                    "자동 키워드 선택: "
+                    f"{keyword} / 점수 {picked.get('score', 0)} / 검색량 {picked.get('volume', 0)} "
+                    f"/ 경쟁 {picked.get('competition', -1)} / {picked.get('difficulty', 'unknown')}",
+                )
             self._log(state, f"작성 대상: {target_context}")
             self._log(state, f"[1/6] 키워드 분석: {keyword}")
             analysis = analyze_keyword(keyword, max_competition=profile["max_competition"], limit=8)

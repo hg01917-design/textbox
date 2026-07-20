@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 
+from config import DATA_DIR, DRAFTS_DIR, load_env
+from .analyzer import difficulty_label, get_blog_count
+from .scorer import get_search_volume, opportunity_score
 from .suggest import google_suggest, naver_suggest
 
 
@@ -86,6 +90,13 @@ _MONTHLY_IDEAS = {
 
 def keyword_ideas(blog_type: str, limit: int = 12) -> list[str]:
     """Return ready-to-use seed keywords for users who do not know what to type."""
+    rows = keyword_opportunities(blog_type, limit=limit)
+    if rows:
+        return [row["keyword"] for row in rows]
+    return _seed_keywords(blog_type, limit=limit)
+
+
+def _seed_keywords(blog_type: str, limit: int = 12) -> list[str]:
     base = list(_IDEAS.get(blog_type, _IDEAS["일반"]))
     if blog_type in {"생활정보", "일반"}:
         base = list(_MONTHLY_IDEAS.get(datetime.now().month, [])) + base
@@ -106,3 +117,117 @@ def keyword_ideas(blog_type: str, limit: int = 12) -> list[str]:
         if len(result) >= limit:
             break
     return result
+
+
+def _intent_score(keyword: str, blog_type: str) -> int:
+    terms = {
+        "정부지원": ["신청", "조건", "대상", "자격", "서류", "지원금", "혜택"],
+        "여행": ["코스", "예약", "준비물", "비용", "숙소", "패스", "공항", "가족여행"],
+        "IT": ["해결", "방법", "추천", "비교", "설정", "백업", "오류"],
+        "생활정보": ["제거", "줄이는", "방법", "청소", "냄새", "전기세", "습기", "곰팡이"],
+        "리뷰": ["추천", "비교", "후기", "선택", "가성비", "실사용"],
+    }.get(blog_type, ["방법", "추천", "비교", "체크리스트"])
+    score = sum(12 for term in terms if term in keyword)
+    words = len(keyword.split())
+    if 3 <= words <= 6:
+        score += 25
+    elif words > 6:
+        score += 10
+    if any(term in keyword for term in ["추천", "예약", "비교", "지원금", "신청"]):
+        score += 15
+    return score
+
+
+def _blocked_keyword(keyword: str) -> bool:
+    lowered = keyword.lower()
+    blocked_terms = ["디시", "dcinside", "클리앙", "뽐뿌", "더쿠", "나무위키", "reddit", "펨코"]
+    return any(term in lowered for term in blocked_terms)
+
+
+def _recent_keywords() -> set[str]:
+    recent = set()
+    log_path = DATA_DIR / "publish_log.jsonl"
+    if log_path.exists():
+        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-120:]:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                continue
+            title = str(entry.get("title", "")).strip()
+            if title:
+                recent.add(title)
+    for path in sorted(DRAFTS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:80]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for value in [payload.get("keyword"), payload.get("seed_keyword"), payload.get("draft", {}).get("title")]:
+            if value:
+                recent.add(str(value).strip())
+    return recent
+
+
+def _recently_used(keyword: str, recent: set[str]) -> bool:
+    compact = keyword.replace(" ", "")
+    for item in recent:
+        item_compact = item.replace(" ", "")
+        if compact and (compact in item_compact or item_compact in compact):
+            return True
+    return False
+
+
+def _competition_score(competition: int) -> int:
+    if competition < 0:
+        return 35
+    if competition < 3_000:
+        return 80
+    if competition < 10_000:
+        return 95
+    if competition < 50_000:
+        return 75
+    if competition < 120_000:
+        return 35
+    return 10
+
+
+def keyword_opportunities(blog_type: str, limit: int = 12) -> list[dict]:
+    """Rank keyword candidates for revenue-oriented posts.
+
+    Sources: curated seasonal/category seeds + Naver/Google autocomplete.
+    Signals: search volume when SearchAd keys exist, Naver blog competition, and
+    commercial/problem-solving intent for the selected blog type.
+    """
+    load_env()
+    recent = _recent_keywords()
+    candidates = [
+        keyword for keyword in _seed_keywords(blog_type, limit=24)
+        if not _blocked_keyword(keyword) and not _recently_used(keyword, recent)
+    ]
+    if not candidates:
+        candidates = [keyword for keyword in _seed_keywords(blog_type, limit=24) if not _blocked_keyword(keyword)]
+    rows = []
+    for keyword in candidates:
+        competition = get_blog_count(keyword)
+        volume = get_search_volume(keyword)
+        if volume > 0:
+            score = opportunity_score(volume, max(competition, 0)) + _intent_score(keyword, blog_type)
+        else:
+            score = _competition_score(competition) + _intent_score(keyword, blog_type)
+        rows.append({
+            "keyword": keyword,
+            "volume": volume,
+            "competition": competition,
+            "difficulty": difficulty_label(competition),
+            "score": round(score, 2),
+        })
+    rows.sort(key=lambda row: (-row["score"], row["competition"] if row["competition"] >= 0 else 999999999))
+    return rows[:limit]
+
+
+def best_keyword_idea(blog_type: str) -> dict:
+    rows = keyword_opportunities(blog_type, limit=1)
+    if rows:
+        return rows[0]
+    seeds = _seed_keywords(blog_type, limit=1)
+    keyword = seeds[0] if seeds else "생활비 절약 방법"
+    return {"keyword": keyword, "volume": 0, "competition": -1, "difficulty": "unknown", "score": 0}
