@@ -1,4 +1,5 @@
 """네이버 블로그 발행 — CDP + playwright-stealth (SmartEditor3)"""
+import html
 import re
 import subprocess
 import time
@@ -7,7 +8,7 @@ import traceback
 from pathlib import Path
 
 from .browser import connect, get_page
-from .accounts import ensure_chrome_for, login_account_id
+from .accounts import close_chrome, ensure_chrome_for, login_account_id
 from .login import ensure_naver_login, logout_after_post_enabled, logout_naver
 
 
@@ -116,6 +117,9 @@ def _section_headings(sections: list) -> list[str]:
     return headings
 
 
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
 def _iter_naver_blocks(sections: list):
     for section in sections:
         if section["type"] == "heading":
@@ -128,6 +132,11 @@ def _iter_naver_blocks(sections: list):
             continue
         paragraphs = re.split(r'\n\s*\n', section["body"])
         for para in paragraphs:
+            if _MARKDOWN_LINK_RE.search(para):
+                html_body = _markdown_block_to_html(para)
+                if html_body:
+                    yield "html", html_body
+                continue
             lines = [_clean_markdown_line(line) for line in para.split('\n')]
             lines = [line for line in lines if line]
             if lines:
@@ -154,6 +163,76 @@ def _clean_markdown_line(line: str) -> str:
     return line.strip()
 
 
+def _inline_markdown_to_html(text: str) -> str:
+    text = html.escape(text.strip())
+    text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(r"__([^_]+?)__", r"<strong>\1</strong>", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+
+    def repl(match):
+        label = match.group(1)
+        url = match.group(2)
+        return f'<a href="{url}" target="_blank" rel="nofollow noopener">{label}</a>'
+
+    return _MARKDOWN_LINK_RE.sub(repl, text)
+
+
+def _markdown_block_to_html(markdown: str) -> str:
+    lines = [line.strip() for line in markdown.split('\n')]
+    html_lines: list[str] = []
+    list_items: list[str] = []
+
+    def flush_list():
+        if list_items:
+            html_lines.append(f"<ul>{''.join(list_items)}</ul>")
+            list_items.clear()
+
+    for line in lines:
+        if not line:
+            flush_list()
+            continue
+        if re.fullmatch(r"[-*_]{3,}", line):
+            flush_list()
+            html_lines.append("<hr>")
+            continue
+        heading = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading:
+            flush_list()
+            html_lines.append(f"<p><strong>{_inline_markdown_to_html(heading.group(1))}</strong></p>")
+            continue
+        bullet = re.match(r"^[-*+]\s+(.+)$", line)
+        if bullet:
+            list_items.append(f"<li>{_inline_markdown_to_html(bullet.group(1))}</li>")
+            continue
+        flush_list()
+        html_lines.append(f"<p>{_inline_markdown_to_html(line)}</p>")
+
+    flush_list()
+    return "".join(html_lines).strip()
+
+
+def _html_to_plain_text(html_text: str) -> str:
+    text = re.sub(r"<\s*li[^>]*>", "- ", html_text)
+    text = re.sub(r"<\s*/\s*li\s*>", "\n", text)
+    text = re.sub(r"<\s*/\s*(p|div|h[1-6]|ul|ol)\s*>", "\n", text)
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text)
+    text = re.sub(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", r"\2 (\1)", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _links_from_html(html_text: str) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for match in re.finditer(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html_text, flags=re.I | re.S):
+        url = html.unescape(match.group(1)).strip()
+        label = re.sub(r"<[^>]+>", "", match.group(2))
+        label = html.unescape(label).strip()
+        if label and url.startswith("http"):
+            links.append({"label": label, "url": url})
+    return links
+
+
 # ─── 헬퍼 ────────────────────────────────────────────────────────
 
 def _chunked_type(page, text: str, chunk: int = 40, delay: int = 130):
@@ -166,6 +245,303 @@ def _paste_text(page, text: str):
     subprocess.run(["pbcopy"], input=text, text=True, check=False)
     page.keyboard.press("Meta+v")
     time.sleep(random.uniform(0.2, 0.4))
+
+
+def _paste_html(page, html_text: str) -> bool:
+    plain_text = _html_to_plain_text(html_text)
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeHTML, NSPasteboardTypeString
+
+        pasteboard = NSPasteboard.generalPasteboard()
+        pasteboard.clearContents()
+        pasteboard.setString_forType_(html_text, NSPasteboardTypeHTML)
+        pasteboard.setString_forType_(plain_text, NSPasteboardTypeString)
+    except Exception:
+        _paste_text(page, plain_text)
+        return False
+
+    page.keyboard.press("Meta+v")
+    time.sleep(random.uniform(0.35, 0.7))
+    return True
+
+
+def _linkify_pasted_block(page, html_text: str, on_log=None) -> int:
+    links = _links_from_html(html_text)
+    if not links:
+        return 0
+    try:
+        count = page.evaluate(r"""(links) => {
+            const content = document.querySelector('.se-content');
+            if (!content) return 0;
+            const paragraphs = Array.from(content.querySelectorAll(
+                '.se-component.se-text .se-text-paragraph, .se-component.se-text [contenteditable="true"]'
+            )).filter(el => !el.closest('.se-documentTitle')).reverse();
+
+            const normalize = s => (s || '').replace(/\s+/g, ' ').trim();
+            const textNodes = root => {
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                    acceptNode(node) {
+                        if (!node.nodeValue || !normalize(node.nodeValue)) return NodeFilter.FILTER_REJECT;
+                        if (node.parentElement && node.parentElement.closest('a')) return NodeFilter.FILTER_REJECT;
+                        return NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                const nodes = [];
+                let node;
+                while ((node = walker.nextNode())) nodes.push(node);
+                return nodes;
+            };
+
+            const replaceOnce = (root, label, url) => {
+                const existing = Array.from(root.querySelectorAll('a[href]')).find(a =>
+                    normalize(a.textContent) === label && (a.href === url || a.getAttribute('href') === url)
+                );
+                if (existing) return true;
+
+                for (const node of textNodes(root)) {
+                    const value = node.nodeValue || '';
+                    const idx = value.indexOf(label);
+                    if (idx < 0) continue;
+
+                    const before = value.slice(0, idx);
+                    let after = value.slice(idx + label.length);
+                    const visibleUrl = ` (${url})`;
+                    if (after.startsWith(visibleUrl)) after = after.slice(visibleUrl.length);
+
+                    const anchor = document.createElement('a');
+                    anchor.href = url;
+                    anchor.target = '_blank';
+                    anchor.rel = 'nofollow noopener';
+                    anchor.textContent = label;
+
+                    const frag = document.createDocumentFragment();
+                    if (before) frag.appendChild(document.createTextNode(before));
+                    frag.appendChild(anchor);
+                    if (after) frag.appendChild(document.createTextNode(after));
+                    node.parentNode.replaceChild(frag, node);
+
+                    const editable = root.closest('[contenteditable="true"]') || root.querySelector('[contenteditable="true"]') || root;
+                    editable.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'formatSetBlockTextDirection'}));
+                    editable.dispatchEvent(new Event('change', {bubbles: true}));
+                    return true;
+                }
+                return false;
+            };
+
+            let linked = 0;
+            for (const link of links) {
+                const label = normalize(link.label);
+                const url = link.url;
+                if (!label || !url) continue;
+                for (const paragraph of paragraphs) {
+                    if (!normalize(paragraph.innerText || paragraph.textContent || '').includes(label)) continue;
+                    if (replaceOnce(paragraph, label, url)) {
+                        linked += 1;
+                        break;
+                    }
+                }
+            }
+            return linked;
+        }""", links)
+        if count:
+            _log(on_log, f"[네이버] 링크 후처리 완료: {count}개")
+        return int(count or 0)
+    except Exception as exc:
+        _log(on_log, f"[네이버] 링크 후처리 실패: {exc}")
+        return 0
+
+
+def _select_pasted_link_text(page, label: str) -> bool:
+    try:
+        return bool(page.evaluate(r"""(label) => {
+            const content = document.querySelector('.se-content');
+            if (!content || !label) return false;
+            const paragraphs = Array.from(content.querySelectorAll(
+                '.se-component.se-text .se-text-paragraph, .se-component.se-text [contenteditable="true"]'
+            )).filter(el => !el.closest('.se-documentTitle')).reverse();
+
+            for (const paragraph of paragraphs) {
+                const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT, {
+                    acceptNode(node) {
+                        if (!node.nodeValue || !node.nodeValue.includes(label)) return NodeFilter.FILTER_REJECT;
+                        return NodeFilter.FILTER_ACCEPT;
+                    }
+                });
+                let node;
+                while ((node = walker.nextNode())) {
+                    const idx = node.nodeValue.indexOf(label);
+                    if (idx < 0) continue;
+                    paragraph.scrollIntoView({block: 'center'});
+                    const range = document.createRange();
+                    range.setStart(node, idx);
+                    range.setEnd(node, idx + label.length);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                    const editable = paragraph.closest('[contenteditable="true"]') || paragraph.querySelector('[contenteditable="true"]') || paragraph;
+                    editable.focus();
+                    return true;
+                }
+            }
+            return false;
+        }""", label))
+    except Exception:
+        return False
+
+
+def _click_link_toolbar_button(page) -> bool:
+    selectors = [
+        'button[data-name="link"]',
+        'button[data-command="link"]',
+        'button[class*="link"]',
+        '.se-toolbar button:has-text("링크")',
+    ]
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=800):
+                btn.click()
+                time.sleep(0.4)
+                return True
+        except Exception:
+            pass
+    try:
+        clicked = page.evaluate(r"""() => {
+            const visible = el => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).visibility !== 'hidden';
+            };
+            const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(visible);
+            const btn = buttons.find(el => {
+                const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.title || '').trim();
+                const cls = el.className ? String(el.className) : '';
+                return /링크|URL|url|link/i.test(text) || /link/i.test(cls);
+            });
+            if (!btn) return false;
+            btn.click();
+            return true;
+        }""")
+        if clicked:
+            time.sleep(0.4)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _fill_link_dialog(page, url: str) -> bool:
+    input_selectors = [
+        'input[type="url"]',
+        'input[placeholder*="URL"]',
+        'input[placeholder*="url"]',
+        'input[placeholder*="링크"]',
+        'input[class*="url"]',
+        'input[class*="link"]',
+        '.se-popup input',
+        '[role="dialog"] input',
+    ]
+    for sel in input_selectors:
+        try:
+            locator = page.locator(sel).last
+            if locator.is_visible(timeout=1200):
+                locator.fill(url)
+                time.sleep(0.2)
+                break
+        except Exception:
+            continue
+    else:
+        return False
+
+    try:
+        confirmed = page.evaluate(r"""() => {
+            const visible = el => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).visibility !== 'hidden';
+            };
+            const dialogs = Array.from(document.querySelectorAll('.se-popup, [role="dialog"], body')).filter(visible);
+            for (const dialog of dialogs) {
+                const buttons = Array.from(dialog.querySelectorAll('button, a, [role="button"]')).filter(visible);
+                const ok = buttons.find(btn => /확인|적용|삽입|완료|저장|입력/.test((btn.innerText || btn.textContent || '').trim()));
+                if (ok) {
+                    ok.click();
+                    return true;
+                }
+            }
+            return false;
+        }""")
+        if not confirmed:
+            page.keyboard.press("Enter")
+        time.sleep(0.5)
+        return True
+    except Exception:
+        try:
+            page.keyboard.press("Enter")
+            time.sleep(0.5)
+            return True
+        except Exception:
+            return False
+
+
+def _insert_links_with_editor_ui(page, html_text: str, on_log=None) -> int:
+    links = _links_from_html(html_text)
+    inserted = 0
+    for link in links:
+        label = link.get("label", "")
+        url = link.get("url", "")
+        if not label or not url:
+            continue
+        if not _select_pasted_link_text(page, label):
+            _log(on_log, f"[네이버] 링크 텍스트 선택 실패: {label[:40]}")
+            continue
+        time.sleep(0.2)
+
+        opened = False
+        try:
+            page.keyboard.press("Meta+k")
+            time.sleep(0.5)
+            opened = True
+        except Exception:
+            opened = False
+        if not _fill_link_dialog(page, url):
+            if not opened or _click_link_toolbar_button(page):
+                if not _fill_link_dialog(page, url):
+                    _log(on_log, f"[네이버] 링크 URL 입력 실패: {label[:40]}")
+                    continue
+            else:
+                _log(on_log, f"[네이버] 링크 버튼 열기 실패: {label[:40]}")
+                continue
+        inserted += 1
+        _close_editor_popups(page)
+    if inserted:
+        _log(on_log, f"[네이버] 에디터 링크 삽입 완료: {inserted}개")
+    return inserted
+
+
+def _close_editor_popups(page) -> None:
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            scope.evaluate(r"""() => {
+                const visible = el => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+                };
+                for (const btn of document.querySelectorAll('.se-popup-close-button, .se-popup-button-confirm, button[aria-label*="닫기"]')) {
+                    if (visible(btn)) btn.click();
+                }
+                for (const popup of document.querySelectorAll('.se-popup, .se-popup-alert, .se-popup-dim, .se-popup-dim-white')) {
+                    if (visible(popup)) popup.style.display = 'none';
+                }
+            }""")
+        except Exception:
+            pass
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.2)
+    except Exception:
+        pass
 
 
 def _type_text(page, text: str, chunk: int = 60, delay: int = 35):
@@ -704,7 +1080,17 @@ def _insert_template(page, template_name: str, on_log=None) -> bool:
     콘텐츠를 넣을지 전혀 판단하지 않고, 이름으로 지정된 저장된 템플릿을 그대로
     불러오기만 한다.
     """
+    def editor_size() -> int:
+        try:
+            return int(page.evaluate(r"""() => {
+                const content = document.querySelector('.se-content');
+                return content ? (content.innerText || '').length + (content.innerHTML || '').length : 0;
+            }""") or 0)
+        except Exception:
+            return 0
+
     try:
+        before_size = editor_size()
         toolbar_btn = page.query_selector(".se-template-toolbar-button")
         if not toolbar_btn:
             _log(on_log, "[네이버] 템플릿 버튼을 찾을 수 없습니다.")
@@ -735,13 +1121,15 @@ def _insert_template(page, template_name: str, on_log=None) -> bool:
             return False
         time.sleep(0.8)
 
-        # 이름이 일치하는 템플릿 카드 클릭
+        # 이름이 일치하는 템플릿 카드 클릭. 네이버 UI는 계정/버전에 따라
+        # 카드 클릭만으로 삽입되거나, 선택 후 적용/삽입 버튼을 눌러야 한다.
         clicked = page.evaluate(r"""(name) => {
             const items = document.querySelectorAll('.se-doc-template-item');
             for (const item of items) {
                 const titleEl = item.querySelector('.se-doc-template-title');
                 if (titleEl && titleEl.innerText.trim() === name) {
                     const link = item.querySelector('.se-doc-template') || item;
+                    link.scrollIntoView({block: 'center'});
                     link.click();
                     return true;
                 }
@@ -753,6 +1141,46 @@ def _insert_template(page, template_name: str, on_log=None) -> bool:
             page.keyboard.press("Escape")
             return False
         time.sleep(1.2)
+
+        def inserted() -> bool:
+            time.sleep(0.4)
+            return editor_size() > before_size + 20
+
+        if not inserted():
+            page.evaluate(r"""() => {
+                const visible = el => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+                };
+                const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]')).filter(visible);
+                const apply = buttons.find(btn => /적용|삽입|사용|확인|불러오기/.test((btn.innerText || btn.textContent || '').trim()));
+                if (apply) apply.click();
+            }""")
+            time.sleep(1.0)
+
+        if not inserted():
+            page.evaluate(r"""(name) => {
+                const items = document.querySelectorAll('.se-doc-template-item');
+                for (const item of items) {
+                    const titleEl = item.querySelector('.se-doc-template-title');
+                    if (titleEl && titleEl.innerText.trim() === name) {
+                        const link = item.querySelector('.se-doc-template') || item;
+                        link.dispatchEvent(new MouseEvent('dblclick', {bubbles: true, cancelable: true, view: window}));
+                        return true;
+                    }
+                }
+                return false;
+            }""", template_name)
+            time.sleep(1.2)
+
+        if not inserted():
+            _log(on_log, f"[네이버] 템플릿 '{template_name}' 선택은 했지만 본문 적용 확인 실패")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
 
         # 패널 닫기
         page.keyboard.press("Escape")
@@ -766,6 +1194,31 @@ def _insert_template(page, template_name: str, on_log=None) -> bool:
         except Exception:
             pass
         return False
+
+
+def _cleanup_inserted_template(page, template_name: str, on_log=None) -> None:
+    """Remove template title/placeholder text that can collide with generated body."""
+    labels = {template_name.strip(), "쿠팡", "마이리얼트립", "제목"}
+    labels = {label for label in labels if label}
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            removed = scope.evaluate(r"""(labels) => {
+                const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+                let count = 0;
+                for (const comp of Array.from(document.querySelectorAll('.se-content .se-component.se-text, .se-content .se-component.se-sectionTitle'))) {
+                    if (comp.closest('.se-documentTitle')) continue;
+                    const text = clean(comp.innerText || comp.textContent || '');
+                    if (!text || labels.includes(text)) {
+                        comp.remove();
+                        count += 1;
+                    }
+                }
+                return count;
+            }""", list(labels))
+            if removed:
+                _log(on_log, f"[네이버] 템플릿 잔여 텍스트 정리: {removed}개")
+        except Exception:
+            continue
 
 
 def _body_text(page) -> str:
@@ -986,65 +1439,232 @@ def _clear_body(page, on_log=None) -> bool:
 
 
 def _title_text(page) -> str:
-    try:
-        text = page.evaluate(r"""() => {
-            const el = document.querySelector('.se-documentTitle');
-            return el ? (el.innerText || el.textContent || '') : '';
-        }""")
-        text = _clean_editor_text(text)
-        return "" if text in {"제목", "제목을 입력하세요"} else text
-    except Exception:
-        return ""
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            text = scope.evaluate(r"""() => {
+                const el = document.querySelector('.se-documentTitle');
+                return el ? (el.innerText || el.textContent || '') : '';
+            }""")
+            text = _clean_editor_text(text)
+            if text and text not in {"제목", "제목을 입력하세요"}:
+                return text
+        except Exception:
+            continue
+    return ""
+
+
+def _raw_title_text(page) -> str:
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            text = scope.evaluate(r"""() => {
+                const para = document.querySelector('.se-documentTitle .se-text-paragraph');
+                return para ? (para.innerText || para.textContent || '') : '';
+            }""")
+            text = _clean_editor_text(text)
+            if text:
+                return text
+        except Exception:
+            continue
+    return ""
 
 
 def _replace_title(page, title: str, on_log=None) -> bool:
     """템플릿이 제목 영역에 남긴 문구를 실제 글 제목으로 완전히 교체한다."""
+    scopes = [page, *getattr(page, "frames", [])]
+    for scope in scopes:
+        try:
+            scope.wait_for_selector(".se-documentTitle .se-text-paragraph, .se-documentTitle [contenteditable='true']", timeout=5000)
+        except Exception:
+            continue
+        try:
+            try:
+                title_box = scope.locator('.se-documentTitle .se-text-paragraph').first.bounding_box(timeout=1500)
+            except Exception:
+                title_box = None
+            if title_box:
+                page.mouse.click(
+                    title_box["x"] + min(title_box["width"] - 10, 650),
+                    title_box["y"] + title_box["height"] / 2,
+                )
+                time.sleep(0.25)
+                for _ in range(120):
+                    page.keyboard.press("Backspace")
+                    time.sleep(0.003)
+                time.sleep(0.15)
+                _type_text(page, title, chunk=80, delay=25)
+                time.sleep(0.8)
+                page.keyboard.press("Tab")
+                time.sleep(0.4)
+                current = _raw_title_text(page)
+                if current == title:
+                    _log(on_log, f"[네이버] 제목 입력 완료(끝클릭삭제): {title[:50]}")
+                    _remove_leading_editor_body_title(page, title, on_log=on_log)
+                    return True
+                _log(on_log, f"[네이버] 제목 끝클릭삭제 확인 실패: {current[:80]}")
+
+            command_result = scope.evaluate(r"""(title) => {
+                const visible = el => {
+                    if (!el) return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+                };
+                const target = Array.from(document.querySelectorAll(
+                    '.se-documentTitle .se-text-paragraph, .se-documentTitle [contenteditable="true"], [class*="documentTitle"] [contenteditable="true"], .se-documentTitle'
+                )).find(visible);
+                if (!target) return {ok: false, text: ''};
+                target.scrollIntoView({block: 'center'});
+                target.focus();
+                target.click();
+
+                const range = document.createRange();
+                range.selectNodeContents(target);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+
+                const inserted = document.execCommand('insertText', false, title);
+                target.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: title}));
+                target.dispatchEvent(new Event('change', {bubbles: true}));
+                target.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: 'Process'}));
+                const text = (target.innerText || target.textContent || '').replace(/\s+/g, ' ').trim();
+                return {ok: inserted && text === title, text};
+            }""", title)
+            time.sleep(0.6)
+            current = _raw_title_text(page)
+            if command_result and command_result.get("ok") and current == title:
+                _log(on_log, f"[네이버] 제목 입력 완료(입력명령): {title[:50]}")
+                _remove_leading_editor_body_title(page, title, on_log=on_log)
+                return True
+            _log(on_log, f"[네이버] 제목 입력명령 확인 실패: {(command_result or {}).get('text', '')[:80] or current[:80]}")
+
+            attempts = [
+                ("타이핑", lambda: _type_text(page, title, chunk=80, delay=25)),
+                ("붙여넣기", lambda: _paste_text(page, title)),
+            ]
+            for label, writer in attempts:
+                if not _select_title_field(scope, page):
+                    _log(on_log, f"[네이버] 제목칸 선택 실패: {label}")
+                    continue
+                time.sleep(0.2)
+                page.keyboard.press("Meta+a")
+                time.sleep(0.1)
+                page.keyboard.press("Backspace")
+                time.sleep(0.2)
+                writer()
+                time.sleep(0.8)
+                page.keyboard.press("Tab")
+                time.sleep(0.5)
+                current = _raw_title_text(page)
+                if current == title:
+                    _log(on_log, f"[네이버] 제목 입력 완료({label}): {title[:50]}")
+                    _remove_leading_editor_body_title(page, title, on_log=on_log)
+                    return True
+                _log(on_log, f"[네이버] 제목 {label} 확인 실패: {current[:80]}")
+        except Exception as exc:
+            _log(on_log, f"[네이버] 제목 교체 오류: {exc}")
+            continue
+    return False
+
+
+def _select_title_field(scope, page) -> bool:
     try:
-        page.wait_for_selector(".se-documentTitle .se-text-paragraph", timeout=10000)
-        selected = page.evaluate(r"""() => {
-            const para = document.querySelector('.se-documentTitle .se-text-paragraph');
-            if (!para) return false;
-            para.scrollIntoView({block: 'center'});
-            para.focus();
-            para.click();
+        selected = scope.evaluate(r"""() => {
+            const visible = el => {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+            };
+            const title = document.querySelector('.se-documentTitle');
+            const target = Array.from(document.querySelectorAll(
+                '.se-documentTitle .se-text-paragraph, .se-documentTitle [contenteditable="true"], [class*="documentTitle"] [contenteditable="true"], .se-documentTitle'
+            )).find(visible);
+            if (!target || !title) return false;
+            target.scrollIntoView({block: 'center'});
+            target.focus();
+            target.click();
+
             const range = document.createRange();
-            range.selectNodeContents(para);
+            range.selectNodeContents(target);
             const sel = window.getSelection();
             sel.removeAllRanges();
             sel.addRange(range);
+
+            // SmartEditor sometimes leaves the caret inside the first text node
+            // after a click. Re-apply a whole-title range after focus settles.
+            setTimeout(() => {
+                try {
+                    const retryRange = document.createRange();
+                    retryRange.selectNodeContents(target);
+                    const retrySel = window.getSelection();
+                    retrySel.removeAllRanges();
+                    retrySel.addRange(retryRange);
+                } catch (_) {}
+            }, 0);
             return true;
         }""")
-        if not selected:
-            return False
-        time.sleep(0.2)
-        page.keyboard.press("Backspace")
-        time.sleep(0.2)
-        _paste_text(page, title)
-        time.sleep(0.5)
-        current = _title_text(page)
-        if current == title:
+        if selected:
+            time.sleep(0.2)
             return True
+    except Exception:
+        pass
+    selectors = [
+        ".se-documentTitle .se-text-paragraph",
+        ".se-documentTitle [contenteditable='true']",
+        "[class*='documentTitle'] [contenteditable='true']",
+        ".se-documentTitle",
+    ]
+    for selector in selectors:
+        try:
+            target = scope.locator(selector).first
+            if target.is_visible(timeout=800):
+                target.click(timeout=2000, force=True, click_count=3)
+                time.sleep(0.2)
+                return True
+        except Exception:
+            continue
+    return False
 
-        applied = page.evaluate(r"""(title) => {
-            const para = document.querySelector('.se-documentTitle .se-text-paragraph');
-            if (!para) return false;
-            para.innerHTML = '';
-            const span = document.createElement('span');
-            span.textContent = title;
-            para.appendChild(span);
-            para.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: title}));
-            para.dispatchEvent(new Event('change', {bubbles: true}));
-            return true;
-        }""", title)
-        time.sleep(0.4)
-        current = _title_text(page)
-        ok = bool(applied and current == title)
-        if not ok:
-            _log(on_log, f"[네이버] 제목 교체 확인 필요: {current[:80]}")
-        return ok
-    except Exception as exc:
-        _log(on_log, f"[네이버] 제목 교체 오류: {exc}")
+
+def _remove_leading_editor_body_title(page, title: str, on_log=None) -> bool:
+    clean_title = _clean_markdown_line((title or "").split('\n')[0]).strip()
+    if not clean_title:
         return False
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            removed = scope.evaluate(r"""(title) => {
+                const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+                const bodyParas = Array.from(document.querySelectorAll(
+                    '.se-content .se-component.se-text .se-text-paragraph, .se-content .se-component.se-text [contenteditable="true"]'
+                )).filter(el => !el.closest('.se-documentTitle'));
+                const first = bodyParas.find(el => clean(el.innerText || el.textContent));
+                if (!first) return false;
+                const text = first.innerText || first.textContent || '';
+                if (!clean(text).startsWith(title)) return false;
+
+                const walker = document.createTreeWalker(first, NodeFilter.SHOW_TEXT, {
+                    acceptNode(node) {
+                        return node.nodeValue && node.nodeValue.includes(title)
+                            ? NodeFilter.FILTER_ACCEPT
+                            : NodeFilter.FILTER_REJECT;
+                    }
+                });
+                let node;
+                while ((node = walker.nextNode())) {
+                    const idx = node.nodeValue.indexOf(title);
+                    if (idx < 0) continue;
+                    node.nodeValue = node.nodeValue.slice(0, idx) + node.nodeValue.slice(idx + title.length).replace(/^\s+/, '');
+                    first.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));
+                    first.dispatchEvent(new Event('change', {bubbles: true}));
+                    return true;
+                }
+                return false;
+            }""", clean_title)
+            if removed:
+                _log(on_log, "[네이버] 본문에 잘못 들어간 제목을 제거했습니다.")
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _is_body_empty(page) -> bool:
@@ -1110,7 +1730,7 @@ def _wait_for_editor_after_login(page, editor_url: str, blog_id: str = "", on_lo
     """
     deadline = time.time() + timeout
     last_log = 0.0
-    retried_postwrite = False
+    last_postwrite_retry = 0.0
     auto_login_attempted = False
     while time.time() < deadline:
         try:
@@ -1133,7 +1753,7 @@ def _wait_for_editor_after_login(page, editor_url: str, blog_id: str = "", on_lo
                 if ensure_naver_login(page, blog_id, account_id=account_id, on_log=on_log):
                     try:
                         page.goto(editor_url, wait_until="domcontentloaded", timeout=30000)
-                        retried_postwrite = True
+                        last_postwrite_retry = time.time()
                         time.sleep(2)
                     except Exception as exc:
                         _log(on_log, f"[네이버] 로그인 후 글쓰기 재이동 실패: {exc}")
@@ -1153,11 +1773,11 @@ def _wait_for_editor_after_login(page, editor_url: str, blog_id: str = "", on_lo
             has_editor = bool(page.query_selector(".se-content"))
         except Exception:
             has_editor = False
-        if not retried_postwrite and not has_editor:
+        if not has_editor and now - last_postwrite_retry > 12:
             try:
                 _log(on_log, "[네이버] 로그인 후 글쓰기 화면으로 다시 이동합니다.")
                 page.goto(editor_url, wait_until="domcontentloaded", timeout=30000)
-                retried_postwrite = True
+                last_postwrite_retry = time.time()
                 time.sleep(2)
                 continue
             except Exception as exc:
@@ -1219,6 +1839,391 @@ def _log(on_log, message: str) -> None:
         on_log(message)
 
 
+def _strip_leading_body_title(markdown: str, title: str) -> tuple[str, bool]:
+    clean_title = _clean_markdown_line((title or "").split('\n')[0]).strip()
+    if not clean_title:
+        return markdown, False
+
+    lines = markdown.split('\n')
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or re.fullmatch(r"[-*_]{3,}", stripped):
+            continue
+        candidate = re.sub(r"^(제목\s*[:：]|title\s*[:：])\s*", "", stripped, flags=re.I)
+        candidate = _clean_markdown_line(candidate)
+        if candidate == clean_title:
+            del lines[idx]
+            while lines and (not lines[0].strip() or re.fullmatch(r"[-*_]{3,}", lines[0].strip())):
+                lines.pop(0)
+            return '\n'.join(lines).lstrip(), True
+        return markdown, False
+    return markdown, False
+
+
+def _naver_hashtag_text(title: str, content_markdown: str, tags: list[str]) -> str:
+    tag_list = _build_naver_tags(title, content_markdown, tags)
+    return " ".join(f"#{tag}" for tag in tag_list)
+
+
+def _build_naver_tags(title: str, content_markdown: str, tags: list[str], limit: int = 20) -> list[str]:
+    stop_words = {
+        "추천", "후기", "리뷰", "정리", "기준", "방법", "순서", "먼저", "실제", "직접",
+        "써보고", "남은", "좋은", "상품", "관련", "많이", "봤던", "것들", "전에",
+        "사기", "전", "체크", "체크할", "체크리스트", "부분", "도움된", "자주", "묻는", "질문",
+        "따라", "구매", "추천을", "청소에", "고르는", "나눠서", "보는",
+        "쿠팡", "쿠팡파트너스", "마이리얼트립", "파트너스", "제휴", "활동", "포스팅",
+    }
+
+    def clean_tag(value: str) -> str:
+        value = re.sub(r"https?://\S+", "", value or "")
+        value = value.lstrip("#").strip()
+        value = re.sub(r"[\[\]()`*_~!@#$%^&=+{}|;:'\"<>,.?/\\]+", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        if not value:
+            return ""
+        return re.sub(r"[^0-9A-Za-z가-힣]", "", value)[:24]
+
+    def add(value: str):
+        tag = clean_tag(value)
+        if not tag or len(tag) < 2:
+            return
+        if _bad_naver_tag(tag):
+            return
+        if tag in stop_words or any(word in tag for word in ("수수료", "제공받", "포스팅은")):
+            return
+        if tag not in result:
+            result.append(tag)
+
+    result: list[str] = []
+    for tag in tags or []:
+        add(tag)
+
+    title_text = re.split(r"[,—\-:：|]", title or "")[0]
+    words = [w for w in re.findall(r"[0-9A-Za-z가-힣]+", title_text) if w and w not in stop_words]
+    if len(words) >= 2:
+        add(" ".join(words[: min(5, len(words))]))
+    if len(words) >= 2:
+        add(" ".join(words[:2]))
+    if words:
+        add(words[0])
+    if len(words) >= 2:
+        add(words[1])
+    for n in (3, 2):
+        for i in range(max(0, len(words) - n + 1)):
+            phrase = words[i:i + n]
+            if phrase and phrase[-1] in {"추천", "후기", "리뷰"}:
+                add(" ".join(phrase))
+            elif n == 2:
+                add(" ".join(phrase))
+            if len(result) >= limit:
+                return result[:limit]
+
+    title_base = words[:2]
+    if title_base:
+        base = " ".join(title_base)
+        for suffix in ["비교", "후기", "가성비", "실사용", "선택", "장단점", "체크리스트"]:
+            add(f"{base} {suffix}")
+            if len(result) >= limit:
+                break
+
+    product_terms = _extract_product_terms(content_markdown, stop_words)
+    for term in product_terms:
+        add(term)
+        if title_base:
+            add(f"{term} 추천")
+        if len(result) >= limit:
+            break
+
+    headings = re.findall(r"(?m)^#{2,3}\s+(.+)$|^ㅂㅂㅂ\s*(.+)$", content_markdown or "")
+    for pair in headings:
+        heading = next((x for x in pair if x), "")
+        heading_words = [w for w in re.findall(r"[0-9A-Za-z가-힣]+", heading) if w not in stop_words]
+        if len(heading_words) == 2:
+            add(" ".join(heading_words))
+        if len(result) >= limit:
+            break
+
+    return result[:limit]
+
+
+def _bad_naver_tag(tag: str) -> bool:
+    bad_exact = {
+        "있어요", "있습니다", "아이가", "합니다", "됩니다", "있다면", "없다면", "보세요",
+        "그리고", "하지만", "그래서", "이런", "저런", "해당", "정도", "경우", "제품은",
+    }
+    if tag in bad_exact:
+        return True
+    bad_parts = [
+        "부터", "보면", "실제로", "좋았던", "아쉬운", "비슷한", "이런분", "함께본",
+        "나눠", "몰랐던", "제품들과", "선택인지", "확인해야", "추천대상", "비추천",
+    ]
+    if any(part in tag for part in bad_parts):
+        return True
+    if re.search(r"(이가|가요|나요|세요|어요|아요|니다|다면|지만|라고|으로|에서|에게|에는|에도|부터|까지|하면|되면|와|과|을|를|은|는|이|가)$", tag):
+        return True
+    return False
+
+
+def _extract_product_terms(content_markdown: str, stop_words: set[str]) -> list[str]:
+    terms: list[str] = []
+    allowed_suffixes = (
+        "매트", "발매트", "커버", "슬리퍼", "제습제", "제습기", "청소솔", "브러쉬", "용기",
+        "선풍기", "보조배터리", "수납템", "건조대", "우산꽂이", "베개커버", "소재",
+        "규조토", "극세사", "실리콘", "나일론", "EVA", "PVC", "TPE", "코르크",
+    )
+    for word in re.findall(r"[0-9A-Za-z가-힣]{2,}", content_markdown or ""):
+        if word in stop_words or _bad_naver_tag(word) or re.fullmatch(r"\d+", word):
+            continue
+        if word in {"소재", "재질", "제품", "선택", "관리"}:
+            continue
+        if any(suffix.lower() in word.lower() for suffix in allowed_suffixes):
+            if word not in terms:
+                terms.append(word)
+        if len(terms) >= 12:
+            break
+    return terms
+
+
+def _append_naver_hashtags(page, hashtag_text: str, on_log=None) -> bool:
+    if not hashtag_text:
+        return False
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            inserted = scope.evaluate(r"""(hashtagText) => {
+                const content = document.querySelector('.se-content');
+                if (!content) return false;
+                const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+                for (const comp of Array.from(content.querySelectorAll('.se-component'))) {
+                    if (!comp.closest('.se-documentTitle') && clean(comp.innerText || comp.textContent) === hashtagText) return 'exists';
+                }
+
+                const firstTag = hashtagText.split(/\s+/)[0];
+                for (const comp of Array.from(content.querySelectorAll('.se-component'))) {
+                    if (comp.closest('.se-documentTitle')) continue;
+                    if (clean(comp.innerText || comp.textContent).startsWith(firstTag)) comp.remove();
+                }
+
+                const id = () => 'SE-' + (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(16).slice(2));
+                const compId = id();
+                const moduleId = id();
+                const paraId = id();
+                const spanId = id();
+
+                const comp = document.createElement('div');
+                comp.className = 'se-component se-text se-l-default';
+                comp.id = compId;
+                comp.dataset.compid = compId;
+                comp.dataset.a11yTitle = '본문';
+                comp.innerHTML = `
+                    <div class="se-component-content">
+                        <div class="se-section se-section-text se-l-default">
+                            <div id="${moduleId}" class="se-module se-module-text __se-unit">
+                                <p id="${paraId}" class="se-text-paragraph se-text-paragraph-align-left" style="line-height: 1.8;">
+                                    <span id="${spanId}" class="se-ff-nanumgothic se-fs19 __se-node" style="color: rgb(0, 0, 0);"></span>
+                                </p>
+                            </div>
+                        </div>
+                    </div>`;
+                comp.querySelector('span').textContent = hashtagText;
+
+                const components = Array.from(content.querySelectorAll('.se-component'))
+                    .filter(el => !el.closest('.se-documentTitle'));
+                const last = components[components.length - 1];
+                if (last) last.insertAdjacentElement('afterend', comp);
+                else content.appendChild(comp);
+
+                comp.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: hashtagText}));
+                comp.dispatchEvent(new Event('change', {bubbles: true}));
+                comp.scrollIntoView({block: 'center'});
+                return true;
+            }""", hashtag_text)
+            if inserted:
+                _log(on_log, f"[네이버] 본문 해시태그 추가: {hashtag_text}")
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _fill_naver_publish_tags(page, tags: list[str], on_log=None) -> int:
+    if not tags:
+        return 0
+    inserted = 0
+    for tag in tags[:20]:
+        tag = str(tag or "").strip().lstrip("#")
+        if not tag:
+            continue
+        for scope in [page, *getattr(page, "frames", [])]:
+            try:
+                # 링크 삽입 팝업이 남아 있으면 URL 입력창이 포커스를 빼앗는다.
+                scope.evaluate(r"""() => {
+                    for (const btn of document.querySelectorAll('.se-popup-close-button, button[aria-label*="닫기"]')) {
+                        const rect = btn.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) btn.click();
+                    }
+                }""")
+            except Exception:
+                pass
+            try:
+                locator = scope.locator('#tag-input, input[id*="tag"], input[class*="tag"], input[placeholder*="태그"]').first
+                if not locator.is_visible(timeout=900):
+                    continue
+                before = scope.evaluate(r"""() => Array.from(document.querySelectorAll('[class*="tag"]'))
+                    .map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+                    .filter(Boolean).join('\n')""")
+                locator.click(timeout=2000)
+                time.sleep(0.15)
+                locator.fill(tag)
+                time.sleep(0.1)
+                locator.press("Enter")
+                time.sleep(random.uniform(0.35, 0.7))
+                after = scope.evaluate(r"""() => Array.from(document.querySelectorAll('[class*="tag"]'))
+                    .map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())
+                    .filter(Boolean).join('\n')""")
+                if tag in after or before != after:
+                    inserted += 1
+                    break
+            except Exception:
+                continue
+    if inserted:
+        _log(on_log, f"[네이버] 발행 태그 입력 완료: {inserted}개")
+    return inserted
+
+
+def _open_publish_panel(page, on_log=None) -> bool:
+    _close_editor_popups(page)
+
+    def has_tag_input() -> bool:
+        for scope in [page, *getattr(page, "frames", [])]:
+            try:
+                if scope.evaluate("() => !!document.querySelector('#tag-input, input[placeholder*=\"태그\"]')"):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if has_tag_input():
+        _log(on_log, "[네이버] 발행 패널 열림")
+        return True
+
+    selectors = [
+        '.publish_btn__m9KHH',
+        'button[class*="publish_btn"]',
+        'button[class*="publishBtn"]',
+    ]
+    for attempt in range(3):
+        for scope in [page, *getattr(page, "frames", [])]:
+            clicked = False
+            for sel in selectors:
+                try:
+                    btn = scope.locator(sel).first
+                    if btn.is_visible(timeout=700):
+                        btn.click(timeout=3000, force=True)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                try:
+                    result = scope.evaluate(r"""() => {
+                        const visible = el => {
+                            const rect = el.getBoundingClientRect();
+                            return rect.width > 0 && rect.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+                        };
+                        const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+                        const btn = buttons.find(b => (b.textContent || '').trim() === '발행' && b.getBoundingClientRect().top < 120);
+                        if (!btn) return null;
+                        const rect = btn.getBoundingClientRect();
+                        btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window}));
+                        btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window}));
+                        btn.click();
+                        return {x: rect.left + rect.width / 2, y: rect.top + rect.height / 2};
+                    }""")
+                    clicked = bool(result)
+                    if result:
+                        time.sleep(0.3)
+                        if not has_tag_input():
+                            page.mouse.click(result["x"], result["y"])
+                except Exception:
+                    clicked = False
+            if clicked:
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    if has_tag_input():
+                        _log(on_log, "[네이버] 발행 패널 열림")
+                        return True
+                    time.sleep(0.4)
+        if has_tag_input():
+            _log(on_log, "[네이버] 발행 패널 열림")
+            return True
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+        except Exception:
+            pass
+    _log(on_log, "[네이버] 발행 패널 열기 실패")
+    return False
+
+
+def _close_publish_panel(page) -> None:
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            closed = scope.evaluate(r"""() => {
+                for (const btn of document.querySelectorAll('button, a, [role="button"]')) {
+                    const text = (btn.textContent || btn.getAttribute('aria-label') || btn.title || '').trim();
+                    if (!/발행\s*설정\s*닫기|닫기|취소/.test(text)) continue;
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if closed:
+                time.sleep(0.5)
+                return
+        except Exception:
+            pass
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.4)
+    except Exception:
+        pass
+
+
+def _save_naver_draft(page, on_log=None):
+    for scope in [page, *getattr(page, "frames", [])]:
+        try:
+            saved = scope.evaluate(r"""() => {
+                for (const btn of document.querySelectorAll('button')) {
+                    const t = (btn.textContent || '').trim();
+                    if (t === '발행' || t === '공개발행' || t === '발행하기') continue;
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    if (t === '임시저장' || t === '저장') {
+                        btn.click();
+                        return t;
+                    }
+                }
+                return false;
+            }""")
+            if saved:
+                return saved
+        except Exception:
+            pass
+        for sel in ['.save_btn__bzc5B', 'button[class*="save_btn"]', 'button[class*="saveBtn"]']:
+            try:
+                btn = scope.locator(sel).first
+                if btn.is_visible(timeout=700):
+                    btn.click()
+                    return True
+            except Exception:
+                continue
+    _log(on_log, "[네이버] 임시저장 버튼을 찾지 못했습니다.")
+    return False
+
+
 # ─── 메인 함수 ───────────────────────────────────────────────────
 
 def post_naver(blog_id: str, title: str, content_markdown: str,
@@ -1238,12 +2243,17 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
     """
     tags = tags or []
     image_paths = [p for p in (image_paths or []) if Path(p).exists()]
+    content_markdown, removed_body_title = _strip_leading_body_title(content_markdown, title)
+    if removed_body_title:
+        _log(on_log, "[네이버] 본문 첫 줄의 중복 제목을 제거했습니다.")
+    naver_tags = _build_naver_tags(title, content_markdown, tags)
     sections = _parse_sections(content_markdown)
 
     if port is None:
         port = ensure_chrome_for("naver", blog_id, on_log=on_log)
     pw, browser = connect(port=port)
     page = None
+    completed_ok = False
     try:
         editor_url = f"https://blog.naver.com/{blog_id}/postwrite"
         page = get_page(browser, navigate_to=None)
@@ -1260,7 +2270,7 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
             opened = _open_editor(page, blog_id, on_log=on_log)
             time.sleep(random.uniform(2, 3))
             if not opened and not page.query_selector(".se-content"):
-                return {"ok": False, "error": f"네이버 로그인 후 글쓰기 화면 진입 실패: {page.url}"}
+                _log(on_log, f"[네이버] 즉시 글쓰기 진입 실패 — 대기 재시도 계속: {page.url}")
 
         current_url = page.url
         if "about:blank" in current_url:
@@ -1295,29 +2305,33 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
                              f"남은 내용: {existing_body[:120]}",
                 }
 
-        # ── 템플릿 삽입 (고지 배지 + 쿠폰 배너가 합쳐진 템플릿, 항상 맨 처음) ──
+        clean_title = title.split('\n')[0].strip()
+
+        # ── 템플릿 삽입: 먼저 쿠팡/MRT 템플릿을 실제 적용한 뒤,
+        # 템플릿 제목(예: 쿠팡)을 글 제목으로 덮어쓴다.
         if template_name:
             if not _focus_body(page):
+                _log(on_log, "[네이버] 템플릿 삽입 전 본문 포커스 실패 — 제목 아래 영역 클릭 후 계속 진행합니다.")
                 _click_body_area_by_position(page)
             time.sleep(0.3)
             if _insert_template(page, template_name, on_log=on_log):
-                _focus_body(page)
-                page.keyboard.press("End")
-                _press_enter(page, 1)
+                _cleanup_inserted_template(page, template_name, on_log=on_log)
             else:
                 _log(on_log, "[네이버] 템플릿 삽입 실패 — 템플릿 없이 계속 진행합니다.")
 
-        # ── 제목 입력 ──
-        clean_title = title.split('\n')[0].strip()
+        # ── 제목 입력: 템플릿이 제목칸에 넣은 '쿠팡' 같은 문구를 실제 제목으로 덮어쓰기 ──
         if not _replace_title(page, clean_title, on_log=on_log):
             return {"ok": False, "error": f"네이버 제목 입력 실패 — 현재 제목: {_title_text(page)[:120]}"}
 
-        # ── 본문 영역 포커스 (템플릿 뒤로 이동) ──
-        if not _focus_body(page):
+        # ── 본문 영역 포커스: 템플릿을 먼저 넣은 경우 템플릿 뒤 새 문단에서 작성 ──
+        if template_name:
+            if not _move_to_body_end(page):
+                _log(on_log, "[네이버] 템플릿 뒤 본문 위치 확인 실패 — 제목 아래 영역 클릭 후 계속 진행합니다.")
+                _click_body_area_by_position(page)
+            _press_enter(page, 1)
+        elif not _focus_body(page):
             _log(on_log, "[네이버] 본문 포커스 자동 확인 실패 — 제목 아래 영역 클릭 후 계속 진행합니다.")
             _click_body_area_by_position(page)
-        else:
-            page.keyboard.press("Meta+End")
         time.sleep(random.uniform(0.5, 1.0))
 
         # ── 본문 입력 + 이미지 분산 삽입 ──
@@ -1349,6 +2363,18 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
                 preview = f"표 {len(rows)}x{max(len(r) for r in rows)}"
                 _log(on_log, f"[네이버] 블록 입력 중 [{index + 1}/{n_blocks}] {preview}")
                 _insert_naver_table(page, rows, on_log=on_log)
+            elif block_type == "html":
+                preview = _html_to_plain_text(content).replace("\n", " ")
+                _log(on_log, f"[네이버] 링크 블록 입력 중 [{index + 1}/{n_blocks}] {preview[:20]}{'...' if len(preview) > 20 else ''}")
+                pasted_as_html = _paste_html(page, content)
+                if not pasted_as_html:
+                    _log(on_log, "[네이버] HTML 붙여넣기 실패 — URL 포함 텍스트로 대체")
+                linked_count = _insert_links_with_editor_ui(page, content, on_log=on_log)
+                if linked_count == 0:
+                    linked_count = _linkify_pasted_block(page, content, on_log=on_log)
+                if linked_count == 0:
+                    _log(on_log, "[네이버] 에디터 링크 삽입 결과 0개 — 수동 확인 필요")
+                _press_enter(page, 1)
             else:
                 text = content
                 _log(on_log, f"[네이버] 블록 입력 중 [{index + 1}/{n_blocks}] {text[:20]}{'...' if len(text) > 20 else ''}")
@@ -1372,47 +2398,20 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
         if n_images > 0:
             _log(on_log, f"[네이버] 카드 이미지 삽입 결과: {uploaded}/{n_images}장")
 
+        final_title_text = _raw_title_text(page)
+        if final_title_text != clean_title:
+            _log(on_log, f"[네이버] 저장 전 제목 재확인 — 현재 제목: {final_title_text[:80]}")
+            if not _replace_title(page, clean_title, on_log=on_log):
+                return {"ok": False, "error": f"네이버 저장 전 제목 재입력 실패 — 현재 제목: {_raw_title_text(page)[:120]}"}
+
         time.sleep(random.uniform(1.0, 2.0))
 
-        # ── 발행 패널 열기 ──
-        if status == "publish":
-            panel_opened = False
+        # ── 발행 패널 열기: 실제 발행뿐 아니라 임시저장도 태그 편집을 위해 사용 ──
+        panel_opened = False
+        if status == "publish" or naver_tags:
+            panel_opened = _open_publish_panel(page, on_log=on_log)
 
-            # 방법 1: 알려진 class명 시도 (네이버가 자주 바꿈)
-            for sel in [
-                '.publish_btn__m9KHH',
-                'button[class*="publish_btn"]',
-                'button[class*="publishBtn"]',
-            ]:
-                try:
-                    btn = page.locator(sel).first
-                    if btn.is_visible(timeout=1500):
-                        btn.click()
-                        panel_opened = True
-                        break
-                except Exception:
-                    pass
-
-            # 방법 2: 화면 상단 '발행' 텍스트 버튼 (class명 무관)
-            if not panel_opened:
-                try:
-                    panel_opened = bool(page.evaluate("""() => {
-                        for (const btn of document.querySelectorAll('button')) {
-                            const t = (btn.textContent || '').trim();
-                            if (t !== '발행') continue;
-                            const rect = btn.getBoundingClientRect();
-                            if (rect.width > 0 && rect.height > 0 && rect.top < 200) {
-                                btn.click(); return true;
-                            }
-                        }
-                        return false;
-                    }"""))
-                except Exception:
-                    pass
-
-            _log(on_log, "[네이버] 발행 패널 열림" if panel_opened else "[네이버] 발행 패널 열기 실패 — 직접 발행 버튼 탐색으로 진행")
-            time.sleep(random.uniform(1.5, 2.5))
-
+        if panel_opened:
             # 카테고리
             if category:
                 try:
@@ -1431,18 +2430,13 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
                     pass
 
             # 태그
-            if tags:
-                try:
-                    tag_input = page.locator('#tag-input')
-                    if tag_input.is_visible(timeout=2000):
-                        for tag in tags[:10]:
-                            tag_input.click()
-                            time.sleep(0.2)
-                            tag_input.fill(tag.strip())
-                            page.keyboard.press("Enter")
-                            time.sleep(random.uniform(0.5, 1.0))
-                except Exception:
-                    pass
+            if naver_tags:
+                inserted_tags = _fill_naver_publish_tags(page, naver_tags, on_log=on_log)
+                if inserted_tags == 0:
+                    _log(on_log, "[네이버] 발행 태그 입력창을 찾지 못했습니다.")
+
+            if status != "publish":
+                _close_publish_panel(page)
 
         # ── 임시저장 또는 발행 ──
         time.sleep(random.uniform(1.0, 1.5))
@@ -1479,24 +2473,7 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
                 _log(on_log, f"[네이버] 패널 내 발행 버튼 클릭: '{saved}'")
         else:
             # 임시저장
-            saved = page.evaluate("""() => {
-                for (const btn of document.querySelectorAll('button')) {
-                    const t = btn.textContent.trim();
-                    if (t === '발행' || t === '공개발행' || t === '발행하기') continue;
-                    if (t === '임시저장' || t.includes('저장')) {
-                        btn.click(); return t;
-                    }
-                }
-                return false;
-            }""")
-            if not saved:
-                try:
-                    save_btn = page.locator('.save_btn__bzc5B')
-                    if save_btn.is_visible(timeout=2000):
-                        save_btn.click()
-                        saved = True
-                except Exception:
-                    pass
+            saved = _save_naver_draft(page, on_log=on_log)
             if not saved:
                 page.keyboard.press("Meta+s")
 
@@ -1511,6 +2488,7 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
             time.sleep(random.uniform(2.0, 3.0))
 
         label = "발행" if status == "publish" else "임시저장"
+        completed_ok = True
         return {"ok": True, "url": page.url, "label": label}
 
     except Exception as e:
@@ -1529,3 +2507,5 @@ def post_naver(blog_id: str, title: str, content_markdown: str,
             pw.stop()
         except Exception:
             pass
+        if completed_ok:
+            close_chrome(port, on_log=on_log)

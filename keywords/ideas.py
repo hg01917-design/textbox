@@ -69,6 +69,34 @@ _IDEAS = {
         "장마철 제습용품 추천",
         "여름 이불 커버 추천",
         "휴대용 보조배터리 추천",
+        "주방 행주 건조대 추천",
+        "차량용 햇빛가리개 추천",
+        "모기퇴치기 추천",
+        "현관 우산꽂이 추천",
+        "세탁망 추천",
+        "여름 실내 슬리퍼 추천",
+        "욕실 발매트 추천",
+        "냉감 베개커버 추천",
+        "장우산 접이식 우산 추천",
+        "옷장 제습제 추천",
+        "신발장 탈취제 추천",
+        "주방 싱크대 물막이 추천",
+        "욕실 물때 제거제 추천",
+        "창문 방충망 보수테이프 추천",
+        "여름 차량용 방향제 추천",
+        "캠핑 모기향 거치대 추천",
+        "책상 선풍기 추천",
+        "침대 쿨매트 추천",
+        "빨래 건조대 추천",
+        "냉장고 탈취제 추천",
+        "다용도 수납 바구니 추천",
+        "화장실 휴지걸이 추천",
+        "샤워기 필터 추천",
+        "주방 기름때 클리너 추천",
+        "현관 자석 도어스토퍼 추천",
+        "창문 틈새막이 추천",
+        "베란다 빨래집게 추천",
+        "욕실 미끄럼방지 매트 추천",
     ],
 }
 
@@ -161,19 +189,42 @@ def _recent_keywords() -> set[str]:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        for value in [payload.get("keyword"), payload.get("seed_keyword"), payload.get("draft", {}).get("title")]:
+        for value in [
+            payload.get("keyword"),
+            payload.get("seed_keyword"),
+            payload.get("analysis", {}).get("best_keyword"),
+            payload.get("draft", {}).get("title"),
+        ]:
             if value:
                 recent.add(str(value).strip())
+        try:
+            recent.add(path.stem.replace("-", " "))
+        except Exception:
+            pass
     return recent
 
 
 def _recently_used(keyword: str, recent: set[str]) -> bool:
     compact = keyword.replace(" ", "")
+    keyword_tokens = _keyword_tokens(keyword)
     for item in recent:
         item_compact = item.replace(" ", "")
         if compact and (compact in item_compact or item_compact in compact):
             return True
+        item_tokens = _keyword_tokens(item)
+        if keyword_tokens and item_tokens:
+            overlap = len(keyword_tokens & item_tokens)
+            if overlap >= min(3, len(keyword_tokens)):
+                return True
     return False
+
+
+def _keyword_tokens(text: str) -> set[str]:
+    stop = {
+        "추천", "후기", "리뷰", "직접", "써보고", "나서야", "알게", "것들", "기준",
+        "선택", "현실적인", "공간", "크기별로", "골라낸", "먼저", "확인", "방법",
+    }
+    return {token for token in text.replace("·", " ").replace("-", " ").split() if len(token) >= 2 and token not in stop}
 
 
 def _competition_score(competition: int) -> int:
@@ -199,12 +250,7 @@ def keyword_opportunities(blog_type: str, limit: int = 12) -> list[dict]:
     """
     load_env()
     recent = _recent_keywords()
-    candidates = [
-        keyword for keyword in _seed_keywords(blog_type, limit=24)
-        if not _blocked_keyword(keyword) and not _recently_used(keyword, recent)
-    ]
-    if not candidates:
-        candidates = [keyword for keyword in _seed_keywords(blog_type, limit=24) if not _blocked_keyword(keyword)]
+    candidates = _unused_seed_keywords(blog_type, recent, limit=72)
     rows = []
     for keyword in candidates:
         competition = get_blog_count(keyword)
@@ -224,10 +270,44 @@ def keyword_opportunities(blog_type: str, limit: int = 12) -> list[dict]:
     return rows[:limit]
 
 
+def _unused_seed_keywords(blog_type: str, recent: set[str], limit: int = 72) -> list[str]:
+    seen = set()
+    result = []
+    for keyword in _seed_keywords(blog_type, limit=limit):
+        keyword = " ".join(str(keyword).split())
+        if not keyword or keyword in seen:
+            continue
+        seen.add(keyword)
+        if _blocked_keyword(keyword) or _recently_used(keyword, recent):
+            continue
+        result.append(keyword)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def best_keyword_idea(blog_type: str) -> dict:
     rows = keyword_opportunities(blog_type, limit=1)
     if rows:
         return rows[0]
-    seeds = _seed_keywords(blog_type, limit=1)
-    keyword = seeds[0] if seeds else "생활비 절약 방법"
+    recent = _recent_keywords()
+    seeds = _unused_seed_keywords(blog_type, recent, limit=1)
+    keyword = seeds[0] if seeds else _emergency_keyword(blog_type, recent)
     return {"keyword": keyword, "volume": 0, "competition": -1, "difficulty": "unknown", "score": 0}
+
+
+def _emergency_keyword(blog_type: str, recent: set[str]) -> str:
+    fallback = {
+        "리뷰": [
+            "주방 수세미 거치대 추천",
+            "욕실 배수구 덮개 추천",
+            "여름 옷걸이 추천",
+            "신발 건조 탈취제 추천",
+        ],
+        "생활정보": ["여름철 침구 습기 제거", "주방 하수구 벌레 예방 방법"],
+        "여행": ["여름 휴가 숙소 예약 팁", "공항 라운지 이용 팁"],
+    }.get(blog_type, ["생활비 절약 체크리스트", "집 정리 수납 방법"])
+    for keyword in fallback:
+        if not _recently_used(keyword, recent):
+            return keyword
+    return f"{fallback[0]} {datetime.now().strftime('%m월')}"

@@ -207,8 +207,11 @@ def ensure_chrome(port: int, user_data_dir: str = "", profile_key: str = "", on_
         _chrome_binary(),
         f"--remote-debugging-port={port}",
         f"--user-data-dir={user_data_dir}",
+        "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-features=ChromeWhatsNewUI,ProfilePickerOnStartup,SignInProfileCreationEnterprise,OptimizationGuideModelDownloading",
+        "about:blank",
     ]
 
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -227,3 +230,54 @@ def ensure_chrome_for(platform: str, blog_id: str, on_log=None) -> int:
     port = _default_port()
     ensure_chrome(port, on_log=on_log)
     return port
+
+
+def close_chrome(port: int | None = None, on_log=None) -> None:
+    """Close the shared CDP Chrome instance for this app."""
+    port = port or _default_port()
+    def port_closed() -> bool:
+        for _ in range(10):
+            if not _port_open(port):
+                return True
+            time.sleep(0.3)
+        return False
+
+    try:
+        import urllib.request
+
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/json/close", timeout=2).read()
+        if port_closed():
+            if on_log:
+                on_log(f"[Chrome] 공유 Chrome 포트 {port} 종료 완료")
+            return
+    except Exception:
+        pass
+
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"TCP:{port}", "-sTCP:LISTEN"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        pids = [pid.strip() for pid in result.stdout.splitlines() if pid.strip().isdigit()]
+        for pid in pids:
+            subprocess.run(["kill", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if port_closed():
+            if on_log:
+                on_log(f"[Chrome] 공유 Chrome 포트 {port} 프로세스 종료 완료")
+            return
+
+        subprocess.run(
+            ["pkill", "-f", f"--remote-debugging-port={port}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        port_closed()
+        if on_log:
+            on_log(f"[Chrome] 공유 Chrome 포트 {port} 프로세스 종료 요청 완료")
+    except Exception as exc:
+        if on_log:
+            on_log(f"[Chrome] 공유 Chrome 종료 실패: {exc}")

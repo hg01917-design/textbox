@@ -6,7 +6,7 @@ import random
 from pathlib import Path
 
 from .browser import connect, get_page
-from .accounts import ensure_chrome_for, login_account_id
+from .accounts import close_chrome, ensure_chrome_for, login_account_id
 from .login import ensure_tistory_login, logout_after_post_enabled, logout_tistory
 
 
@@ -304,6 +304,7 @@ def post_tistory(blog_id: str, title: str, content_markdown: str,
         port = ensure_chrome_for("tistory", blog_id)
     pw, browser = connect(port=port)
     page = None
+    completed_ok = False
     try:
         editor_url = f"https://{blog_id}.tistory.com/manage/newpost"
         page = get_page(browser, navigate_to=editor_url)
@@ -464,6 +465,7 @@ def post_tistory(blog_id: str, title: str, content_markdown: str,
         btn.click()
         time.sleep(3)
 
+        completed_ok = True
         return {"ok": True, "url": page.url}
 
     except Exception as e:
@@ -480,3 +482,5 @@ def post_tistory(blog_id: str, title: str, content_markdown: str,
             pw.stop()
         except Exception:
             pass
+        if completed_ok:
+            close_chrome(port)
